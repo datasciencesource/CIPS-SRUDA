@@ -10,16 +10,36 @@ import time
 
 REMOTE_DB = "jdbc:mysql://69.175.69.34/sumrachna_hd"
 USERNAME = "sumrachna_hd"
-PASSWORD = os.getenv("REMOTE_DB_PASSWORD")
 
-TABLE = "table_stock100"
+PASSWORD = os.getenv("REMOTE_DB_PASSWORD")
+TABLE = os.getenv("SOURCE_TABLE")
+
 HDFS_TARGET = "/security_lab/s0"
 
 # S0 has no study-added security processing
 SECURITY_PROCESSING_TIME = 0.00
 
 # =====================================
-# Check Credential
+# Experimental Dataset Definition
+# =====================================
+
+DATASETS = {
+    "table_stock100": {
+        "scale": "Small",
+        "expected_records": 125
+    },
+    "table_stock20K": {
+        "scale": "Medium",
+        "expected_records": 24858
+    },
+    "table_stock4M": {
+        "scale": "Large",
+        "expected_records": 4248576
+    }
+}
+
+# =====================================
+# Check Credentials and Table
 # =====================================
 
 if not PASSWORD:
@@ -27,6 +47,27 @@ if not PASSWORD:
     print("Run:")
     print("export REMOTE_DB_PASSWORD='your_password'")
     sys.exit(1)
+
+if not TABLE:
+    print("ERROR: SOURCE_TABLE is not set.")
+    print()
+    print("Choose one:")
+    print('export SOURCE_TABLE="table_stock100"')
+    print('export SOURCE_TABLE="table_stock20K"')
+    print('export SOURCE_TABLE="table_stock4M"')
+    sys.exit(1)
+
+if TABLE not in DATASETS:
+    print(f"ERROR: Invalid SOURCE_TABLE: {TABLE}")
+    print()
+    print("Allowed experimental tables:")
+    print("  table_stock100  = Small")
+    print("  table_stock20K  = Medium")
+    print("  table_stock4M   = Large")
+    sys.exit(1)
+
+DATASET_SCALE = DATASETS[TABLE]["scale"]
+EXPECTED_RECORDS = DATASETS[TABLE]["expected_records"]
 
 # =====================================
 # Resource Monitoring
@@ -112,8 +153,10 @@ print("=" * 70)
 print("S0 - SQOOP INGESTION")
 print("=" * 70)
 
-print(f"Source table : {TABLE}")
-print(f"HDFS target  : {HDFS_TARGET}")
+print(f"Dataset scale    : {DATASET_SCALE}")
+print(f"Source table     : {TABLE}")
+print(f"Expected records : {EXPECTED_RECORDS}")
+print(f"HDFS target      : {HDFS_TARGET}")
 print()
 
 # =====================================
@@ -192,6 +235,10 @@ print()
 print("=" * 70)
 print("S0 - SQOOP INGESTION RESULT")
 print("=" * 70)
+
+print(f"Dataset scale                          : {DATASET_SCALE}")
+print(f"Source table                           : {TABLE}")
+print(f"Expected records                       : {EXPECTED_RECORDS}")
 
 if result.returncode == 0:
     print("Execution status                       : SUCCESS")
