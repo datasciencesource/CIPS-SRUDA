@@ -15,6 +15,9 @@ PASSWORD = os.getenv("REMOTE_DB_PASSWORD")
 TABLE = "table_stock100"
 HDFS_TARGET = "/security_lab/s0"
 
+# S0 has no study-added security processing
+SECURITY_PROCESSING_TIME = 0.00
+
 # =====================================
 # Check Credential
 # =====================================
@@ -91,6 +94,7 @@ monitor_thread = threading.Thread(
 
 # =====================================
 # Sqoop Import
+# Remote MySQL -> HDFS
 # =====================================
 
 command = [
@@ -104,9 +108,9 @@ command = [
     "--delete-target-dir"
 ]
 
-print("=" * 60)
+print("=" * 70)
 print("S0 - SQOOP INGESTION")
-print("=" * 60)
+print("=" * 70)
 
 print(f"Source table : {TABLE}")
 print(f"HDFS target  : {HDFS_TARGET}")
@@ -170,73 +174,69 @@ if result.returncode == 0:
     )
 
     if size_result.returncode == 0:
-
         try:
             hdfs_size_bytes = int(
                 size_result.stdout.split()[0]
             )
-
         except (ValueError, IndexError):
             hdfs_size_bytes = 0
 
 
 hdfs_size_mb = hdfs_size_bytes / (1024 ** 2)
-hdfs_size_gb = hdfs_size_bytes / (1024 ** 3)
 
 # =====================================
-# Result
+# Results
 # =====================================
 
 print()
-print("=" * 60)
+print("=" * 70)
 print("S0 - SQOOP INGESTION RESULT")
-print("=" * 60)
+print("=" * 70)
 
 if result.returncode == 0:
-    print("Execution status        : SUCCESS")
+    print("Execution status                       : SUCCESS")
 else:
-    print("Execution status        : FAILED")
+    print("Execution status                       : FAILED")
 
 print(
-    f"Sqoop ingestion time    : "
+    f"Sqoop ingestion time "
+    f"(Remote MySQL -> HDFS)                 : "
     f"{ingestion_time:.2f} seconds"
 )
 
 print(
-    "HDFS storage/write time : "
-    "Included in Sqoop ingestion"
+    f"Additional security-processing time    : "
+    f"{SECURITY_PROCESSING_TIME:.2f} seconds"
 )
 
 print(
-    f"Average CPU utilization : "
+    f"Average CPU utilization                : "
     f"{average_cpu:.2f}%"
 )
 
 print(
-    f"Peak CPU utilization    : "
+    f"Peak CPU utilization                   : "
     f"{peak_cpu:.2f}%"
 )
 
 print(
-    f"Average memory usage    : "
+    f"Average memory utilization             : "
     f"{average_memory:.2f}%"
 )
 
 print(
-    f"Peak memory usage       : "
+    f"Peak memory utilization                : "
     f"{peak_memory:.2f}%"
 )
 
 print(
-    f"HDFS storage size       : "
+    f"HDFS storage size                      : "
     f"{hdfs_size_mb:.4f} MB"
 )
 
-print(
-    f"HDFS storage size       : "
-    f"{hdfs_size_gb:.6f} GB"
-)
-
-print("=" * 60)
+print("=" * 70)
+print("Note: 0.00 security-processing time = no study-added")
+print("      security processing in the S0 baseline.")
+print("=" * 70)
 
 sys.exit(result.returncode)
