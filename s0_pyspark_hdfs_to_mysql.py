@@ -44,12 +44,22 @@ stop_monitoring = threading.Event()
 
 def get_cpu_values():
     with open("/proc/stat", "r") as f:
-        values = list(map(float, f.readline().split()[1:9]))
+        values = list(
+            map(float, f.readline().split()[1:9])
+        )
 
     user, nice, system, idle, iowait, irq, softirq, steal = values
 
     idle_total = idle + iowait
-    active_total = user + nice + system + irq + softirq + steal
+    active_total = (
+        user
+        + nice
+        + system
+        + irq
+        + softirq
+        + steal
+    )
+
     total = idle_total + active_total
 
     return total, idle_total
@@ -61,50 +71,66 @@ def get_memory_percent():
     with open("/proc/meminfo", "r") as f:
         for line in f:
             key, value = line.split(":", 1)
-            meminfo[key] = float(value.strip().split()[0])
+
+            meminfo[key] = float(
+                value.strip().split()[0]
+            )
 
     total = meminfo["MemTotal"]
     available = meminfo["MemAvailable"]
 
-    return ((total - available) / total) * 100
+    return (
+        (total - available) / total
+    ) * 100
 
 
 def monitor_resources():
     previous_total, previous_idle = get_cpu_values()
 
+    # Initial memory sample
+    memory_samples.append(
+        get_memory_percent()
+    )
+
     while not stop_monitoring.wait(0.5):
 
         current_total, current_idle = get_cpu_values()
 
-        total_delta = current_total - previous_total
-        idle_delta = current_idle - previous_idle
+        total_delta = (
+            current_total - previous_total
+        )
+
+        idle_delta = (
+            current_idle - previous_idle
+        )
 
         if total_delta > 0:
+
             cpu_percent = (
-                (total_delta - idle_delta) / total_delta
+                (total_delta - idle_delta)
+                / total_delta
             ) * 100
 
-            cpu_samples.append(cpu_percent)
+            cpu_samples.append(
+                cpu_percent
+            )
 
-        memory_samples.append(get_memory_percent())
+        memory_samples.append(
+            get_memory_percent()
+        )
 
         previous_total = current_total
         previous_idle = current_idle
 
 
-monitor_thread = threading.Thread(
-    target=monitor_resources,
-    daemon=True
-)
-
 # =====================================
-# Start Monitoring
+# Variables
 # =====================================
-
-monitor_thread.start()
 
 spark = None
 data = None
+monitor_thread = None
+monitor_started = False
 
 pyspark_processing_time = 0.0
 mysql_write_time = 0.0
@@ -113,15 +139,19 @@ record_count = 0
 status = "SUCCESS"
 error_message = ""
 
+# =====================================
+# Main Execution
+# =====================================
+
 try:
 
-    print("=" * 60)
+    print("=" * 70)
     print("S0 - PYSPARK PROCESSING")
-    print("=" * 60)
+    print("=" * 70)
 
-    # =====================================
+    # =================================
     # Start Spark
-    # =====================================
+    # =================================
 
     spark = (
         SparkSession.builder
@@ -132,9 +162,9 @@ try:
 
     spark.sparkContext.setLogLevel("ERROR")
 
-    # =====================================
+    # =================================
     # Schema
-    # =====================================
+    # =================================
 
     schema = """
         id INT,
@@ -144,9 +174,25 @@ try:
         stock_date TIMESTAMP
     """
 
-    # =====================================
+    # =================================
+    # Start Resource Monitoring
+    #
+    # Monitoring begins after Spark
+    # startup and immediately before
+    # measured processing.
+    # =================================
+
+    monitor_thread = threading.Thread(
+        target=monitor_resources,
+        daemon=True
+    )
+
+    monitor_thread.start()
+    monitor_started = True
+
+    # =================================
     # PySpark Processing
-    # =====================================
+    # =================================
 
     processing_start = time.time()
 
@@ -162,7 +208,9 @@ try:
         .csv(HDFS_INPUT)
     )
 
-    data.persist(StorageLevel.MEMORY_AND_DISK)
+    data.persist(
+        StorageLevel.MEMORY_AND_DISK
+    )
 
     # Force Spark execution
     record_count = data.count()
@@ -170,14 +218,13 @@ try:
     processing_end = time.time()
 
     pyspark_processing_time = (
-        processing_end - processing_start
+        processing_end
+        - processing_start
     )
 
-    data.show(5, truncate=False)
-
-    # =====================================
+    # =================================
     # Local MySQL Write
-    # =====================================
+    # =================================
 
     mysql_start = time.time()
 
@@ -185,10 +232,22 @@ try:
         data.coalesce(1)
         .write
         .format("jdbc")
-        .option("url", MYSQL_URL)
-        .option("dbtable", MYSQL_TABLE)
-        .option("user", MYSQL_USER)
-        .option("password", MYSQL_PASSWORD)
+        .option(
+            "url",
+            MYSQL_URL
+        )
+        .option(
+            "dbtable",
+            MYSQL_TABLE
+        )
+        .option(
+            "user",
+            MYSQL_USER
+        )
+        .option(
+            "password",
+            MYSQL_PASSWORD
+        )
         .option(
             "driver",
             "com.mysql.cj.jdbc.Driver"
@@ -200,7 +259,38 @@ try:
     mysql_end = time.time()
 
     mysql_write_time = (
-        mysql_end - mysql_start
+        mysql_end
+        - mysql_start
+    )
+
+    # =================================
+    # Stop Resource Monitoring
+    #
+    # Resource monitoring therefore
+    # covers:
+    #
+    # PySpark processing
+    # +
+    # Local MySQL writing
+    # =================================
+
+    stop_monitoring.set()
+
+    if monitor_thread is not None:
+        monitor_thread.join()
+
+    monitor_started = False
+
+    # =================================
+    # Verification Display
+    #
+    # This is intentionally outside
+    # the measured processing interval.
+    # =================================
+
+    data.show(
+        5,
+        truncate=False
     )
 
 except Exception as error:
@@ -210,42 +300,60 @@ except Exception as error:
 
 finally:
 
+    # Stop monitor if an error occurred
+    # before normal monitoring shutdown.
+
+    if monitor_started:
+
+        stop_monitoring.set()
+
+        if monitor_thread is not None:
+            monitor_thread.join()
+
+    # Release cached dataframe
+
     if data is not None:
-        data.unpersist()
+        try:
+            data.unpersist()
+        except Exception:
+            pass
+
+    # Stop Spark
 
     if spark is not None:
-        spark.stop()
-
-    stop_monitoring.set()
-    monitor_thread.join()
+        try:
+            spark.stop()
+        except Exception:
+            pass
 
 # =====================================
 # Resource Results
 # =====================================
 
 average_cpu = (
-    sum(cpu_samples) / len(cpu_samples)
-    if cpu_samples else 0.0
+    sum(cpu_samples)
+    / len(cpu_samples)
+    if cpu_samples
+    else 0.0
 )
 
 peak_cpu = (
     max(cpu_samples)
-    if cpu_samples else 0.0
+    if cpu_samples
+    else 0.0
 )
 
 average_memory = (
-    sum(memory_samples) / len(memory_samples)
-    if memory_samples else 0.0
+    sum(memory_samples)
+    / len(memory_samples)
+    if memory_samples
+    else 0.0
 )
 
 peak_memory = (
     max(memory_samples)
-    if memory_samples else 0.0
-)
-
-spark_mysql_time = (
-    pyspark_processing_time
-    + mysql_write_time
+    if memory_samples
+    else 0.0
 )
 
 # =====================================
@@ -253,62 +361,57 @@ spark_mysql_time = (
 # =====================================
 
 print()
-print("=" * 60)
+print("=" * 70)
 print("S0 - PYSPARK RESULT")
-print("=" * 60)
+print("=" * 70)
 
 print(
-    f"Execution status        : "
+    f"Execution status             : "
     f"{status}"
 )
 
 print(
-    f"PySpark processing time : "
+    f"PySpark processing time      : "
     f"{pyspark_processing_time:.2f} seconds"
 )
 
 print(
-    f"Local MySQL write time  : "
+    f"Local MySQL write time       : "
     f"{mysql_write_time:.2f} seconds"
 )
 
 print(
-    f"Spark + MySQL time      : "
-    f"{spark_mysql_time:.2f} seconds"
-)
-
-print(
-    f"Output records          : "
+    f"Output records               : "
     f"{record_count}"
 )
 
 print(
-    f"Average CPU utilization : "
+    f"Average CPU utilization      : "
     f"{average_cpu:.2f}%"
 )
 
 print(
-    f"Peak CPU utilization    : "
+    f"Peak CPU utilization         : "
     f"{peak_cpu:.2f}%"
 )
 
 print(
-    f"Average memory usage    : "
+    f"Average memory utilization   : "
     f"{average_memory:.2f}%"
 )
 
 print(
-    f"Peak memory usage       : "
+    f"Peak memory utilization      : "
     f"{peak_memory:.2f}%"
 )
 
 if error_message:
     print(
-        f"Error                   : "
+        f"Error                        : "
         f"{error_message}"
     )
 
-print("=" * 60)
+print("=" * 70)
 
 if status == "FAILED":
     sys.exit(1)
