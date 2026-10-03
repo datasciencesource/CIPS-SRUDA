@@ -10,6 +10,46 @@ from datetime import datetime
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 
+# ==========================================================
+# S3 - PROTECTED SQOOP INGESTION
+# ==========================================================
+#
+# IMPORTANT:
+#
+# /security_lab/s3 is MANUALLY managed.
+#
+# This script:
+#   - DOES NOT create /security_lab/s3
+#   - DOES NOT delete /security_lab/s3
+#
+# Before a normal run:
+#
+#   hdfs dfs -rm -r -f /security_lab/s3
+#   hdfs dfs -mkdir -p /security_lab/s3
+#
+# Pipeline:
+#
+# Remote MySQL
+#       ↓
+# Sqoop
+#       ↓
+# /security_lab/s3_staging
+#       ↓
+# SHA-256 hash-chain generation
+#       ↓
+# AES-256-GCM encryption
+#       ↓
+# /security_lab/s3_build/part*
+#       ↓
+# Move encrypted part files only
+#       ↓
+# /security_lab/s3/part*
+#       ↓
+# HDFS Data Availability Check
+#
+# ==========================================================
+
+
 STRATEGY = "S3"
 
 
@@ -17,7 +57,11 @@ STRATEGY = "S3"
 # Remote MySQL Configuration
 # ==========================================================
 
-REMOTE_DB = "jdbc:mysql://69.175.69.34/sumrachna_hd"
+REMOTE_DB = (
+    "jdbc:mysql://69.175.69.34/"
+    "sumrachna_hd"
+)
+
 REMOTE_DB_USER = "sumrachna_hd"
 
 REMOTE_DB_PASSWORD = os.getenv(
@@ -33,19 +77,41 @@ SOURCE_TABLE = os.getenv(
 # HDFS Paths - S3 ONLY
 # ==========================================================
 
-HDFS_STAGING = "/security_lab/s3_staging"
-HDFS_BUILD = "/security_lab/s3_build"
-HDFS_TARGET = "/security_lab/s3"
+# Temporary raw Sqoop data
+HDFS_STAGING = (
+    "/security_lab/s3_staging"
+)
+
+# Temporary protected/encrypted build
+HDFS_BUILD = (
+    "/security_lab/s3_build"
+)
+
+# FINAL S3 target
+#
+# IMPORTANT:
+# This directory must be created manually.
+HDFS_TARGET = (
+    "/security_lab/s3"
+)
 
 
 # ==========================================================
-# Integrity + Confidentiality
+# Integrity Configuration
 # ==========================================================
 
 HASH_ALGORITHM = "SHA-256"
+
 GENESIS_HASH = "GENESIS"
 
-ENCRYPTION_ALGORITHM = "AES-256-GCM"
+
+# ==========================================================
+# Confidentiality Configuration
+# ==========================================================
+
+ENCRYPTION_ALGORITHM = (
+    "AES-256-GCM"
+)
 
 AES_KEY_B64 = os.getenv(
     "S3_AES_KEY_B64"
@@ -53,7 +119,7 @@ AES_KEY_B64 = os.getenv(
 
 
 # ==========================================================
-# S3 Security Event Logging
+# Indicator 12 - Security Event Logging
 # ==========================================================
 
 AUDIT_LOG = os.getenv(
@@ -61,19 +127,22 @@ AUDIT_LOG = os.getenv(
     "/var/log/cips_sruda_s3_audit.log"
 )
 
+
 RUN_ID = os.getenv(
     "S3_RUN_ID",
     (
-        f"S3-{SOURCE_TABLE or 'unknown'}-"
+        f"S3-"
+        f"{SOURCE_TABLE or 'unknown'}-"
         f"{datetime.now().strftime('%Y%m%d-%H%M%S')}"
     )
 )
+
 
 audit_time_total = 0.0
 
 
 # ==========================================================
-# Experimental Datasets
+# Experimental Dataset Definition
 # ==========================================================
 
 DATASETS = {
@@ -96,13 +165,25 @@ DATASETS = {
 
 
 # ==========================================================
-# Validate Environment
+# Validate Environment Variables
 # ==========================================================
 
 if not REMOTE_DB_PASSWORD:
 
     print(
-        "ERROR: REMOTE_DB_PASSWORD is not set."
+        "ERROR: REMOTE_DB_PASSWORD "
+        "is not set."
+    )
+
+    print()
+
+    print(
+        "Example:"
+    )
+
+    print(
+        "export REMOTE_DB_PASSWORD="
+        "'your_password'"
     )
 
     sys.exit(1)
@@ -114,8 +195,22 @@ if not SOURCE_TABLE:
         "ERROR: SOURCE_TABLE is not set."
     )
 
+    print()
+
     print(
-        'Example: export SOURCE_TABLE="table_stock100"'
+        "Choose one:"
+    )
+
+    print(
+        'export SOURCE_TABLE="table_stock100"'
+    )
+
+    print(
+        'export SOURCE_TABLE="table_stock20K"'
+    )
+
+    print(
+        'export SOURCE_TABLE="table_stock4M"'
     )
 
     sys.exit(1)
@@ -128,13 +223,43 @@ if SOURCE_TABLE not in DATASETS:
         f"{SOURCE_TABLE}"
     )
 
+    print()
+
+    print(
+        "Allowed experimental tables:"
+    )
+
+    print(
+        "  table_stock100 = Small"
+    )
+
+    print(
+        "  table_stock20K = Medium"
+    )
+
+    print(
+        "  table_stock4M  = Large"
+    )
+
     sys.exit(1)
 
 
 if not AES_KEY_B64:
 
     print(
-        "ERROR: S3_AES_KEY_B64 is not set."
+        "ERROR: S3_AES_KEY_B64 "
+        "is not set."
+    )
+
+    print()
+
+    print(
+        "Example:"
+    )
+
+    print(
+        'export S3_AES_KEY_B64="'
+        '<your-base64-encoded-32-byte-key>"'
     )
 
     sys.exit(1)
@@ -146,6 +271,7 @@ try:
         AES_KEY_B64,
         validate=True
     )
+
 
 except Exception:
 
@@ -164,6 +290,11 @@ if len(AES_KEY) != 32:
         "32 decoded key bytes."
     )
 
+    print(
+        f"Decoded key length: "
+        f"{len(AES_KEY)} bytes"
+    )
+
     sys.exit(1)
 
 
@@ -173,18 +304,22 @@ aesgcm = AESGCM(
 
 
 DATASET_SCALE = (
-    DATASETS[SOURCE_TABLE]["scale"]
+    DATASETS[
+        SOURCE_TABLE
+    ]["scale"]
 )
 
+
 EXPECTED_RECORDS = (
-    DATASETS[SOURCE_TABLE][
-        "expected_records"
-    ]
+    DATASETS[
+        SOURCE_TABLE
+    ]["expected_records"]
 )
 
 
 # ==========================================================
-# Indicator 12 - Security Event Logging
+# Indicator 12
+# Security Event Logging
 # ==========================================================
 
 def audit_event(
@@ -197,7 +332,11 @@ def audit_event(
 
     global audit_time_total
 
-    start = time.perf_counter()
+
+    start = (
+        time.perf_counter()
+    )
+
 
     timestamp = (
         datetime.now()
@@ -232,8 +371,10 @@ def audit_event(
 
     try:
 
-        directory = os.path.dirname(
-            AUDIT_LOG
+        directory = (
+            os.path.dirname(
+                AUDIT_LOG
+            )
         )
 
 
@@ -259,7 +400,8 @@ def audit_event(
     except Exception as exc:
 
         raise RuntimeError(
-            f"Unable to write S3 audit log: {exc}"
+            "Unable to write "
+            f"S3 audit log: {exc}"
         ) from exc
 
 
@@ -328,9 +470,14 @@ def get_cpu_values():
     )
 
 
-    return (
+    total = (
         idle_total
-        + active_total,
+        + active_total
+    )
+
+
+    return (
+        total,
         idle_total
     )
 
@@ -347,10 +494,13 @@ def get_memory_percent():
 
         for line in f:
 
-            key, value = line.split(
-                ":",
-                1
+            key, value = (
+                line.split(
+                    ":",
+                    1
+                )
             )
+
 
             meminfo[key] = float(
                 value.strip()
@@ -358,13 +508,18 @@ def get_memory_percent():
             )
 
 
-    total = meminfo[
-        "MemTotal"
-    ]
+    total = (
+        meminfo[
+            "MemTotal"
+        ]
+    )
 
-    available = meminfo[
-        "MemAvailable"
-    ]
+
+    available = (
+        meminfo[
+            "MemAvailable"
+        ]
+    )
 
 
     return (
@@ -408,15 +563,20 @@ def monitor_resources():
 
         if total_delta > 0:
 
-            cpu_samples.append(
+            cpu_percent = (
+
                 (
-                    (
-                        total_delta
-                        - idle_delta
-                    )
-                    / total_delta
+                    total_delta
+                    - idle_delta
                 )
-                * 100
+
+                / total_delta
+
+            ) * 100
+
+
+            cpu_samples.append(
+                cpu_percent
             )
 
 
@@ -435,7 +595,7 @@ def monitor_resources():
 
 
 # ==========================================================
-# HDFS Utilities
+# HDFS Utility Functions
 # ==========================================================
 
 def hdfs_remove(
@@ -479,7 +639,6 @@ def get_hdfs_size_bytes(
 ):
 
     result = subprocess.run(
-
         [
             "hdfs",
             "dfs",
@@ -519,7 +678,6 @@ def get_hdfs_part_files(
 ):
 
     result = subprocess.run(
-
         [
             "hdfs",
             "dfs",
@@ -544,10 +702,13 @@ def get_hdfs_part_files(
 
 
     for line in (
-        result.stdout.splitlines()
+        result.stdout
+        .splitlines()
     ):
 
-        fields = line.split()
+        fields = (
+            line.split()
+        )
 
 
         if not fields:
@@ -555,12 +716,19 @@ def get_hdfs_part_files(
             continue
 
 
-        candidate = fields[-1]
+        candidate = (
+            fields[-1]
+        )
 
 
-        if os.path.basename(
-            candidate
-        ).startswith(
+        basename = (
+            os.path.basename(
+                candidate
+            )
+        )
+
+
+        if basename.startswith(
             "part"
         ):
 
@@ -568,6 +736,9 @@ def get_hdfs_part_files(
                 candidate
             )
 
+
+    # Deterministic ordering is important
+    # for the sequential hash chain.
 
     files.sort()
 
@@ -584,17 +755,156 @@ def get_hdfs_part_files(
 
 
 # ==========================================================
-# Indicator 10 - HDFS Data Availability Check
+# MANUAL S3 TARGET VALIDATION
+# ==========================================================
+#
+# /security_lab/s3 must already exist.
+#
+# The script DOES NOT create it.
+#
+# The directory must also be EMPTY before
+# an official normal experiment run.
+#
+# ==========================================================
+
+def validate_manual_s3_target(
+    path
+):
+
+    # ------------------------------------------------------
+    # Check path exists
+    # ------------------------------------------------------
+
+    result = subprocess.run(
+        [
+            "hdfs",
+            "dfs",
+            "-test",
+            "-e",
+            path
+        ]
+    )
+
+
+    if result.returncode != 0:
+
+        raise RuntimeError(
+            "Manual S3 HDFS target "
+            f"does not exist: {path}"
+        )
+
+
+    # ------------------------------------------------------
+    # Check that it is a directory
+    # ------------------------------------------------------
+
+    result = subprocess.run(
+        [
+            "hdfs",
+            "dfs",
+            "-test",
+            "-d",
+            path
+        ]
+    )
+
+
+    if result.returncode != 0:
+
+        raise RuntimeError(
+            "Manual S3 HDFS target "
+            f"is not a directory: {path}"
+        )
+
+
+    # ------------------------------------------------------
+    # Check that it is accessible and empty
+    # ------------------------------------------------------
+
+    result = subprocess.run(
+        [
+            "hdfs",
+            "dfs",
+            "-ls",
+            path
+        ],
+
+        capture_output=True,
+        text=True
+    )
+
+
+    if result.returncode != 0:
+
+        raise RuntimeError(
+            "Unable to access "
+            f"manual S3 target: {path}"
+        )
+
+
+    existing_files = []
+
+
+    for line in (
+        result.stdout
+        .splitlines()
+    ):
+
+        line = (
+            line.strip()
+        )
+
+
+        if not line:
+
+            continue
+
+
+        if line.startswith(
+            "Found "
+        ):
+
+            continue
+
+
+        fields = (
+            line.split()
+        )
+
+
+        if fields:
+
+            existing_files.append(
+                fields[-1]
+            )
+
+
+    if existing_files:
+
+        raise RuntimeError(
+            "Manual S3 HDFS target "
+            "must be empty before the run: "
+            f"{path}"
+        )
+
+
+    return True
+
+
+# ==========================================================
+# Indicator 10
+# HDFS Data Availability Check
 # ==========================================================
 
 def check_hdfs_availability(
     path
 ):
 
-    # Check dataset path exists.
+    # ------------------------------------------------------
+    # Check final S3 dataset path exists
+    # ------------------------------------------------------
 
     result = subprocess.run(
-
         [
             "hdfs",
             "dfs",
@@ -609,15 +919,17 @@ def check_hdfs_availability(
 
         return (
             False,
-            "HDFS dataset path does not exist",
+            "HDFS dataset path "
+            "does not exist",
             0
         )
 
 
-    # Check dataset contains part files.
+    # ------------------------------------------------------
+    # Check final S3 dataset can be listed
+    # ------------------------------------------------------
 
     result = subprocess.run(
-
         [
             "hdfs",
             "dfs",
@@ -634,19 +946,27 @@ def check_hdfs_availability(
 
         return (
             False,
-            "HDFS dataset cannot be listed",
+            "HDFS dataset "
+            "cannot be listed",
             0
         )
 
+
+    # ------------------------------------------------------
+    # Check final S3 dataset contains part files
+    # ------------------------------------------------------
 
     part_files = []
 
 
     for line in (
-        result.stdout.splitlines()
+        result.stdout
+        .splitlines()
     ):
 
-        fields = line.split()
+        fields = (
+            line.split()
+        )
 
 
         if not fields:
@@ -654,12 +974,19 @@ def check_hdfs_availability(
             continue
 
 
-        candidate = fields[-1]
+        candidate = (
+            fields[-1]
+        )
 
 
-        if os.path.basename(
-            candidate
-        ).startswith(
+        basename = (
+            os.path.basename(
+                candidate
+            )
+        )
+
+
+        if basename.startswith(
             "part"
         ):
 
@@ -685,7 +1012,15 @@ def check_hdfs_availability(
 
 
 # ==========================================================
-# Reset S3 Paths
+# Reset TEMPORARY S3 Paths Only
+# ==========================================================
+#
+# IMPORTANT:
+#
+# This function DOES NOT touch:
+#
+# /security_lab/s3
+#
 # ==========================================================
 
 def reset_s3_environment():
@@ -695,7 +1030,7 @@ def reset_s3_environment():
     )
 
     print(
-        "RESETTING PREVIOUS S3 HDFS DATA"
+        "RESETTING TEMPORARY S3 HDFS DATA"
     )
 
     print(
@@ -704,12 +1039,9 @@ def reset_s3_environment():
 
 
     hdfs_remove(
-        HDFS_TARGET
-    )
-
-    hdfs_remove(
         HDFS_STAGING
     )
+
 
     hdfs_remove(
         HDFS_BUILD
@@ -717,25 +1049,28 @@ def reset_s3_environment():
 
 
     print(
-        f"Removed previous target  : "
+        f"Manual target preserved   : "
         f"{HDFS_TARGET}"
     )
 
+
     print(
-        f"Removed previous staging : "
+        f"Removed previous staging  : "
         f"{HDFS_STAGING}"
     )
 
+
     print(
-        f"Removed previous build   : "
+        f"Removed previous build    : "
         f"{HDFS_BUILD}"
     )
+
 
     print()
 
 
 # ==========================================================
-# SHA-256 Hash Chain
+# SHA-256 Hash-Chain Function
 # ==========================================================
 
 def calculate_current_hash(
@@ -743,7 +1078,7 @@ def calculate_current_hash(
     row_data
 ):
 
-    value = (
+    hash_input = (
         previous_hash
         + "|"
         + row_data
@@ -751,14 +1086,14 @@ def calculate_current_hash(
 
 
     return hashlib.sha256(
-        value.encode(
+        hash_input.encode(
             "utf-8"
         )
     ).hexdigest()
 
 
 # ==========================================================
-# AES-256-GCM Encryption
+# AES-256-GCM Encryption Function
 # ==========================================================
 
 def encrypt_protected_row(
@@ -770,38 +1105,44 @@ def encrypt_protected_row(
     )
 
 
-    ciphertext = aesgcm.encrypt(
+    ciphertext = (
+        aesgcm.encrypt(
+            nonce,
+            protected_row.encode(
+                "utf-8"
+            ),
+            None
+        )
+    )
 
-        nonce,
 
-        protected_row.encode(
-            "utf-8"
-        ),
-
-        None
+    encrypted_bytes = (
+        nonce
+        + ciphertext
     )
 
 
     return base64.b64encode(
-
-        nonce
-        + ciphertext
-
+        encrypted_bytes
     ).decode(
         "utf-8"
     )
 
 
 # ==========================================================
-# Generate Protected + Encrypted Dataset
+# Generate Protected + Encrypted S3 Dataset
 # ==========================================================
 
 def generate_encrypted_dataset():
 
-    start = (
+    security_start = (
         time.perf_counter()
     )
 
+
+    # ------------------------------------------------------
+    # Get raw Sqoop files
+    # ------------------------------------------------------
 
     part_files = (
         get_hdfs_part_files(
@@ -809,6 +1150,12 @@ def generate_encrypted_dataset():
         )
     )
 
+
+    # ------------------------------------------------------
+    # Create temporary build directory
+    #
+    # This is NOT /security_lab/s3.
+    # ------------------------------------------------------
 
     hdfs_mkdir(
         HDFS_BUILD
@@ -819,10 +1166,17 @@ def generate_encrypted_dataset():
         GENESIS_HASH
     )
 
+
     protected_records = 0
 
 
-    for input_part in part_files:
+    # ------------------------------------------------------
+    # Process each Sqoop part file
+    # ------------------------------------------------------
+
+    for input_part in (
+        part_files
+    ):
 
         part_name = (
             os.path.basename(
@@ -843,8 +1197,11 @@ def generate_encrypted_dataset():
         )
 
 
-        reader = subprocess.Popen(
+        # --------------------------------------------------
+        # Read raw Sqoop records
+        # --------------------------------------------------
 
+        reader = subprocess.Popen(
             [
                 "hdfs",
                 "dfs",
@@ -859,8 +1216,11 @@ def generate_encrypted_dataset():
         )
 
 
-        writer = subprocess.Popen(
+        # --------------------------------------------------
+        # Write encrypted records to temporary build
+        # --------------------------------------------------
 
+        writer = subprocess.Popen(
             [
                 "hdfs",
                 "dfs",
@@ -893,6 +1253,10 @@ def generate_encrypted_dataset():
                     continue
 
 
+                # ==========================================
+                # Integrity Protection
+                # ==========================================
+
                 current_hash = (
                     calculate_current_hash(
                         previous_hash,
@@ -902,14 +1266,15 @@ def generate_encrypted_dataset():
 
 
                 protected_row = (
-
                     f"{row_data},"
-
                     f"{previous_hash},"
-
                     f"{current_hash}"
                 )
 
+
+                # ==========================================
+                # Confidentiality Protection
+                # ==========================================
 
                 encrypted_row = (
                     encrypt_protected_row(
@@ -918,15 +1283,24 @@ def generate_encrypted_dataset():
                 )
 
 
+                # ==========================================
+                # Store encrypted record
+                # ==========================================
+
                 writer.stdin.write(
                     encrypted_row
                     + "\n"
                 )
 
 
+                # ==========================================
+                # Advance chain
+                # ==========================================
+
                 previous_hash = (
                     current_hash
                 )
+
 
                 protected_records += 1
 
@@ -944,21 +1318,15 @@ def generate_encrypted_dataset():
 
 
         reader_error = (
-
             reader.stderr.read()
-
             if reader.stderr
-
             else ""
         )
 
 
         writer_error = (
-
             writer.stderr.read()
-
             if writer.stderr
-
             else ""
         )
 
@@ -966,6 +1334,7 @@ def generate_encrypted_dataset():
         reader_returncode = (
             reader.wait()
         )
+
 
         writer_returncode = (
             writer.wait()
@@ -975,10 +1344,8 @@ def generate_encrypted_dataset():
         if reader_returncode != 0:
 
             raise RuntimeError(
-
-                "Failed reading "
-                "HDFS staging data:\n"
-
+                "Failed to read HDFS "
+                "staging file:\n"
                 + reader_error
             )
 
@@ -986,13 +1353,15 @@ def generate_encrypted_dataset():
         if writer_returncode != 0:
 
             raise RuntimeError(
-
-                "Failed writing "
-                "encrypted S3 data:\n"
-
+                "Failed to write "
+                "encrypted HDFS file:\n"
                 + writer_error
             )
 
+
+    # ======================================================
+    # Verify Protected Record Count
+    # ======================================================
 
     if (
         protected_records
@@ -1000,51 +1369,89 @@ def generate_encrypted_dataset():
     ):
 
         raise RuntimeError(
-
             "Protected/encrypted "
             "record-count mismatch: "
-
-            f"expected "
-            f"{EXPECTED_RECORDS}, "
-
-            f"generated "
-            f"{protected_records}."
+            f"expected {EXPECTED_RECORDS}, "
+            f"generated {protected_records}."
         )
 
 
-    move_result = subprocess.run(
+    # ======================================================
+    # Move encrypted PART FILES ONLY
+    # into manually created /security_lab/s3
+    #
+    # IMPORTANT:
+    #
+    # HDFS_TARGET already exists.
+    #
+    # We do NOT:
+    #
+    #   hdfs dfs -mv s3_build s3
+    #
+    # because that would create/manage the target.
+    # ======================================================
 
-        [
-            "hdfs",
-            "dfs",
-            "-mv",
-
-            HDFS_BUILD,
-
-            HDFS_TARGET
-        ]
+    build_part_files = (
+        get_hdfs_part_files(
+            HDFS_BUILD
+        )
     )
 
 
-    if move_result.returncode != 0:
+    for build_part in (
+        build_part_files
+    ):
 
-        raise RuntimeError(
+        move_result = (
+            subprocess.run(
+                [
+                    "hdfs",
+                    "dfs",
+                    "-mv",
+                    build_part,
+                    HDFS_TARGET
+                ],
 
-            "Unable to activate final "
-            "S3 encrypted dataset."
+                capture_output=True,
+                text=True
+            )
         )
+
+
+        if move_result.returncode != 0:
+
+            raise RuntimeError(
+                "Unable to move encrypted "
+                "part file into manually "
+                "created S3 target:\n"
+                + move_result.stderr
+            )
+
+
+    # ------------------------------------------------------
+    # Remove now-empty build directory
+    # ------------------------------------------------------
+
+    hdfs_remove(
+        HDFS_BUILD
+    )
+
+
+    security_end = (
+        time.perf_counter()
+    )
+
+
+    security_processing_time = (
+        security_end
+        - security_start
+    )
 
 
     return (
-
         protected_records,
-
         previous_hash,
-
-        (
-            time.perf_counter()
-            - start
-        )
+        security_processing_time
     )
 
 
@@ -1084,9 +1491,11 @@ print(
     "=" * 72
 )
 
+
 print(
     "S3 - PROTECTED SQOOP INGESTION"
 )
+
 
 print(
     "=" * 72
@@ -1098,123 +1507,259 @@ print(
     f"{STRATEGY}"
 )
 
+
 print(
     f"Dataset scale         : "
     f"{DATASET_SCALE}"
 )
+
 
 print(
     f"Source table          : "
     f"{SOURCE_TABLE}"
 )
 
+
 print(
     f"Expected records      : "
     f"{EXPECTED_RECORDS}"
 )
 
+
 print(
-    f"Final HDFS target     : "
+    f"Manual HDFS target    : "
     f"{HDFS_TARGET}"
 )
+
 
 print(
     f"Hash algorithm        : "
     f"{HASH_ALGORITHM}"
 )
 
+
 print(
     f"Encryption algorithm  : "
     f"{ENCRYPTION_ALGORITHM}"
 )
+
 
 print(
     f"AES key length        : "
     f"{len(AES_KEY) * 8} bits"
 )
 
+
 print(
     f"Audit log             : "
     f"{AUDIT_LOG}"
 )
+
 
 print(
     f"Run ID                : "
     f"{RUN_ID}"
 )
 
+
 print()
 
 
 # ==========================================================
-# Preparation
+# PREPARATION
+#
+# Not included in experimental performance timing.
 # ==========================================================
 
 reset_s3_environment()
 
 
-monitor_thread = threading.Thread(
-
-    target=monitor_resources,
-
-    daemon=True
+print(
+    "=" * 72
 )
+
+
+print(
+    "VALIDATING MANUAL S3 HDFS TARGET"
+)
+
+
+print(
+    "=" * 72
+)
+
+
+try:
+
+    validate_manual_s3_target(
+        HDFS_TARGET
+    )
+
+
+    print(
+        f"Manual HDFS target     : "
+        f"{HDFS_TARGET}"
+    )
+
+
+    print(
+        "Target status          : READY"
+    )
+
+
+    print(
+        "Target contents        : EMPTY"
+    )
+
+
+    print(
+        "Target creation        : MANUAL"
+    )
+
+
+    print()
+
+
+except Exception as exc:
+
+    print()
+
+
+    print(
+        f"ERROR: {exc}"
+    )
+
+
+    print()
+
+
+    print(
+        "Create an EMPTY S3 HDFS "
+        "target manually before "
+        "running this script:"
+    )
+
+
+    print()
+
+
+    print(
+        "hdfs dfs -rm -r -f "
+        "/security_lab/s3"
+    )
+
+
+    print(
+        "hdfs dfs -mkdir -p "
+        "/security_lab/s3"
+    )
+
+
+    print()
+
+
+    print(
+        "The script did NOT create "
+        "/security_lab/s3."
+    )
+
+
+    sys.exit(1)
+
+
+# ==========================================================
+# Start Resource Monitoring
+# ==========================================================
+
+monitor_thread = (
+    threading.Thread(
+        target=monitor_resources,
+        daemon=True
+    )
+)
+
 
 monitor_thread.start()
 
 
+# ==========================================================
+# Result Variables
+# ==========================================================
+
 sqoop_returncode = 1
+
+
+sqoop_ingestion_time = 0.0
+
 
 security_status = (
     "NOT RUN"
 )
 
+
 protected_records = 0
 
-final_chain_hash = "N/A"
+
+final_chain_hash = (
+    "N/A"
+)
+
 
 hash_encrypt_time = 0.0
 
+
 hdfs_availability_time = 0.0
+
 
 hdfs_availability_status = (
     "NOT RUN"
 )
 
+
 hdfs_availability_reason = (
     "N/A"
 )
 
+
 hdfs_part_count = 0
 
 
+# ==========================================================
+# Experimental Execution
+# ==========================================================
+
 try:
 
+    # ======================================================
+    # Indicator 12
+    # Log Script Start
+    # ======================================================
+
     audit_event(
-
         "SCRIPT1_START",
-
         "STARTED",
-
         "N/A",
-
         "N/A",
-
-        f"source_table={SOURCE_TABLE}"
+        (
+            f"source_table="
+            f"{SOURCE_TABLE}"
+        )
     )
 
 
     # ======================================================
-    # Stage 1 - Sqoop
+    # STAGE 1 - SQOOP INGESTION
     # ======================================================
 
     print(
         "=" * 72
     )
 
+
     print(
         "STAGE 1 - SQOOP INGESTION"
     )
+
 
     print(
         "=" * 72
@@ -1252,15 +1797,10 @@ try:
     if sqoop_returncode != 0:
 
         audit_event(
-
             "SQOOP_INGESTION",
-
             "FAIL",
-
             "BLOCK",
-
             "SQOOP_FAILURE",
-
             (
                 f"source_table="
                 f"{SOURCE_TABLE}"
@@ -1274,15 +1814,10 @@ try:
 
 
     audit_event(
-
         "SQOOP_INGESTION",
-
         "SUCCESS",
-
         "ALLOW",
-
         "N/A",
-
         (
             f"source_table="
             f"{SOURCE_TABLE}"
@@ -1291,19 +1826,23 @@ try:
 
 
     # ======================================================
-    # Stage 2 - Hash + Encryption
+    # STAGE 2
+    # SHA-256 + AES-256-GCM
     # ======================================================
 
     print()
+
 
     print(
         "=" * 72
     )
 
+
     print(
         "STAGE 2 - SHA-256 HASH CHAIN "
         "+ AES-256-GCM ENCRYPTION"
     )
+
 
     print(
         "=" * 72
@@ -1314,21 +1853,14 @@ try:
         protected_records,
         final_chain_hash,
         hash_encrypt_time
-    ) = (
-        generate_encrypted_dataset()
-    )
+    ) = generate_encrypted_dataset()
 
 
     audit_event(
-
         "INTEGRITY_CONFIDENTIALITY_PROTECTION",
-
         "SUCCESS",
-
         "ALLOW",
-
         "N/A",
-
         (
             f"records="
             f"{protected_records}"
@@ -1337,19 +1869,24 @@ try:
 
 
     # ======================================================
-    # Stage 3 - Indicator 10
+    # STAGE 3
+    # Indicator 10
+    # HDFS Data Availability Check
     # ======================================================
 
     print()
+
 
     print(
         "=" * 72
     )
 
+
     print(
         "STAGE 3 - HDFS DATA "
         "AVAILABILITY CHECK"
     )
+
 
     print(
         "=" * 72
@@ -1365,17 +1902,13 @@ try:
         available,
         reason,
         part_count
-    ) = (
-        check_hdfs_availability(
-            HDFS_TARGET
-        )
+    ) = check_hdfs_availability(
+        HDFS_TARGET
     )
 
 
     hdfs_availability_time = (
-
         time.perf_counter()
-
         - check_start
     )
 
@@ -1383,6 +1916,7 @@ try:
     hdfs_availability_reason = (
         reason
     )
+
 
     hdfs_part_count = (
         part_count
@@ -1397,16 +1931,27 @@ try:
 
 
         audit_event(
-
             "HDFS_AVAILABILITY",
-
             "FAIL",
-
             "BLOCK",
-
             "HDFS_DATASET_UNAVAILABLE",
-
             reason
+        )
+
+
+        print(
+            "HDFS availability     : FAIL"
+        )
+
+
+        print(
+            f"Reason                : "
+            f"{reason}"
+        )
+
+
+        print(
+            "Pipeline decision     : BLOCK"
         )
 
 
@@ -1420,16 +1965,33 @@ try:
     )
 
 
+    print(
+        "HDFS availability     : PASS"
+    )
+
+
+    print(
+        f"HDFS availability reason: "
+        f"{reason}"
+    )
+
+
+    print(
+        f"HDFS part files       : "
+        f"{part_count}"
+    )
+
+
+    print(
+        "Pipeline decision     : CONTINUE"
+    )
+
+
     audit_event(
-
         "HDFS_AVAILABILITY",
-
         "PASS",
-
         "ALLOW",
-
         "N/A",
-
         (
             f"part_files="
             f"{part_count}"
@@ -1442,6 +2004,10 @@ try:
     )
 
 
+# ==========================================================
+# Failure Handler
+# ==========================================================
+
 except Exception as exc:
 
     security_status = (
@@ -1451,6 +2017,7 @@ except Exception as exc:
 
     print()
 
+
     print(
         f"ERROR: {exc}"
     )
@@ -1459,23 +2026,20 @@ except Exception as exc:
     try:
 
         audit_event(
-
             "SCRIPT1_END",
-
             "FAIL",
-
             "BLOCK",
-
             "SCRIPT1_FAILURE",
-
-            str(exc)
-            .replace(
-                "\t",
-                " "
-            )
-            .replace(
-                "\n",
-                " "
+            (
+                str(exc)
+                .replace(
+                    "\t",
+                    " "
+                )
+                .replace(
+                    "\n",
+                    " "
+                )
             )
         )
 
@@ -1483,14 +2047,20 @@ except Exception as exc:
     except Exception as log_exc:
 
         print(
-            f"AUDIT ERROR: "
+            "AUDIT ERROR: "
             f"{log_exc}"
         )
 
 
-    hdfs_remove(
-        HDFS_TARGET
-    )
+    # ------------------------------------------------------
+    # IMPORTANT:
+    #
+    # Do NOT delete HDFS_TARGET.
+    #
+    # /security_lab/s3 is manually managed.
+    #
+    # Only temporary build data is cleaned.
+    # ------------------------------------------------------
 
     hdfs_remove(
         HDFS_BUILD
@@ -1499,24 +2069,38 @@ except Exception as exc:
 
 finally:
 
+    # ------------------------------------------------------
+    # Raw plaintext Sqoop staging is always removed.
+    # ------------------------------------------------------
+
     hdfs_remove(
         HDFS_STAGING
     )
 
 
 # ==========================================================
-# Stop Monitoring
+# Stop Resource Monitoring
 # ==========================================================
 
 stop_monitoring.set()
 
+
 monitor_thread.join()
 
 
+# ==========================================================
+# Resource Results
+# ==========================================================
+
 average_cpu = (
 
-    sum(cpu_samples)
-    / len(cpu_samples)
+    sum(
+        cpu_samples
+    )
+
+    / len(
+        cpu_samples
+    )
 
     if cpu_samples
 
@@ -1526,7 +2110,9 @@ average_cpu = (
 
 peak_cpu = (
 
-    max(cpu_samples)
+    max(
+        cpu_samples
+    )
 
     if cpu_samples
 
@@ -1536,8 +2122,13 @@ peak_cpu = (
 
 average_memory = (
 
-    sum(memory_samples)
-    / len(memory_samples)
+    sum(
+        memory_samples
+    )
+
+    / len(
+        memory_samples
+    )
 
     if memory_samples
 
@@ -1547,7 +2138,9 @@ average_memory = (
 
 peak_memory = (
 
-    max(memory_samples)
+    max(
+        memory_samples
+    )
 
     if memory_samples
 
@@ -1555,20 +2148,19 @@ peak_memory = (
 )
 
 
+# ==========================================================
+# Final Success Audit Event
+# ==========================================================
+
 if security_status == "SUCCESS":
 
     try:
 
         audit_event(
-
             "SCRIPT1_END",
-
             "SUCCESS",
-
             "ALLOW",
-
             "N/A",
-
             (
                 f"records="
                 f"{protected_records}"
@@ -1582,22 +2174,26 @@ if security_status == "SUCCESS":
             f"AUDIT ERROR: {exc}"
         )
 
+
         security_status = (
             "FAILED"
         )
 
 
-hdfs_size_bytes = (
+# ==========================================================
+# Final HDFS Storage Size
+# ==========================================================
 
-    get_hdfs_size_bytes(
-        HDFS_TARGET
+hdfs_size_bytes = 0
+
+
+if security_status == "SUCCESS":
+
+    hdfs_size_bytes = (
+        get_hdfs_size_bytes(
+            HDFS_TARGET
+        )
     )
-
-    if security_status
-    == "SUCCESS"
-
-    else 0
-)
 
 
 hdfs_size_mb = (
@@ -1607,6 +2203,10 @@ hdfs_size_mb = (
     / (1024 ** 2)
 )
 
+
+# ==========================================================
+# Performance Measurements
+# ==========================================================
 
 additional_security_processing_time = (
 
@@ -1620,66 +2220,62 @@ additional_security_processing_time = (
 
 script1_total_measured_time = (
 
-    (
-        sqoop_ingestion_time
-
-        if "sqoop_ingestion_time"
-        in globals()
-
-        else 0.0
-    )
+    sqoop_ingestion_time
 
     + additional_security_processing_time
 )
 
 
-execution_status = (
+# ==========================================================
+# Final Execution Status
+# ==========================================================
 
-    "SUCCESS"
+if (
+    sqoop_returncode == 0
 
-    if (
-
-        sqoop_returncode == 0
-
-        and security_status
-        == "SUCCESS"
-
-        and protected_records
-        == EXPECTED_RECORDS
-
-        and hdfs_availability_status
-        == "PASS"
-    )
-
-    else "FAILED"
-)
-
-
-final_returncode = (
-
-    0
-
-    if execution_status
+    and security_status
     == "SUCCESS"
 
-    else 1
-)
+    and protected_records
+    == EXPECTED_RECORDS
+
+    and hdfs_availability_status
+    == "PASS"
+):
+
+    execution_status = (
+        "SUCCESS"
+    )
+
+    final_returncode = 0
+
+
+else:
+
+    execution_status = (
+        "FAILED"
+    )
+
+    final_returncode = 1
 
 
 # ==========================================================
-# Results
+# Final Results
 # ==========================================================
 
 print()
+
 
 print(
     "=" * 72
 )
 
+
 print(
     "S3 - SQOOP + PROTECTION "
     "+ HDFS AVAILABILITY RESULT"
 )
+
 
 print(
     "=" * 72
@@ -1691,45 +2287,54 @@ print(
     f"{STRATEGY}"
 )
 
+
 print(
     f"Dataset scale                         : "
     f"{DATASET_SCALE}"
 )
+
 
 print(
     f"Source table                          : "
     f"{SOURCE_TABLE}"
 )
 
+
 print(
     f"Expected records                      : "
     f"{EXPECTED_RECORDS}"
 )
+
 
 print(
     f"Protected/encrypted records           : "
     f"{protected_records}"
 )
 
+
 print(
     f"Execution status                      : "
     f"{execution_status}"
 )
+
 
 print(
     f"Security-protection status            : "
     f"{security_status}"
 )
 
+
 print(
     f"HDFS availability                     : "
     f"{hdfs_availability_status}"
 )
 
+
 print(
     f"HDFS availability reason              : "
     f"{hdfs_availability_reason}"
 )
+
 
 print(
     f"HDFS part files                       : "
@@ -1740,35 +2345,39 @@ print(
 print()
 
 
+# ----------------------------------------------------------
+# Timing
+# ----------------------------------------------------------
+
 print(
     f"Sqoop ingestion time                  : "
-    f"{(
-        sqoop_ingestion_time
-        if 'sqoop_ingestion_time'
-        in globals()
-        else 0.0
-    ):.2f} seconds"
+    f"{sqoop_ingestion_time:.2f} seconds"
 )
+
 
 print(
     f"Hash-chain + encryption time          : "
     f"{hash_encrypt_time:.2f} seconds"
 )
 
+
 print(
     f"HDFS availability-check time          : "
     f"{hdfs_availability_time:.4f} seconds"
 )
+
 
 print(
     f"Audit logging time                    : "
     f"{audit_time_total:.4f} seconds"
 )
 
+
 print(
     f"Additional security-processing time   : "
     f"{additional_security_processing_time:.2f} seconds"
 )
+
 
 print(
     f"Script 1 total measured time          : "
@@ -1779,60 +2388,103 @@ print(
 print()
 
 
+# ----------------------------------------------------------
+# Resource Utilization
+# ----------------------------------------------------------
+
 print(
     f"Average CPU utilization               : "
     f"{average_cpu:.2f}%"
 )
+
 
 print(
     f"Peak CPU utilization                  : "
     f"{peak_cpu:.2f}%"
 )
 
+
 print(
     f"Average memory utilization            : "
     f"{average_memory:.2f}%"
 )
+
 
 print(
     f"Peak memory utilization               : "
     f"{peak_memory:.2f}%"
 )
 
+
 print(
     f"HDFS encrypted storage size           : "
     f"{hdfs_size_mb:.4f} MB"
 )
+
+
+print()
+
+
+# ----------------------------------------------------------
+# Security Details
+# ----------------------------------------------------------
+
+print(
+    f"Hash algorithm                        : "
+    f"{HASH_ALGORITHM}"
+)
+
+
+print(
+    f"Genesis previous hash                 : "
+    f"{GENESIS_HASH}"
+)
+
 
 print(
     f"Final chain hash                      : "
     f"{final_chain_hash}"
 )
 
+
 print(
     f"Encryption algorithm                  : "
     f"{ENCRYPTION_ALGORITHM}"
 )
+
 
 print(
     f"AES key size                          : "
     f"{len(AES_KEY) * 8} bits"
 )
 
+
 print(
     f"Final encrypted dataset               : "
     f"{HDFS_TARGET}/part*"
 )
+
+
+print(
+    f"S3 target management                  : "
+    f"MANUAL"
+)
+
 
 print(
     f"Audit log                             : "
     f"{AUDIT_LOG}"
 )
 
+
 print(
     "=" * 72
 )
 
+
+# ==========================================================
+# Exit
+# ==========================================================
 
 sys.exit(
     final_returncode
