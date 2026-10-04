@@ -15,12 +15,13 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 # ==========================================================
 #
 # IMPORTANT:
-#
 # /security_lab/s3 is MANUALLY managed.
 #
 # This script:
 #   - DOES NOT create /security_lab/s3
 #   - DOES NOT delete /security_lab/s3
+#   - CREATES the audit log if it does not exist
+#   - APPENDS to the audit log if it already exists
 #
 # Before a normal run:
 #
@@ -30,22 +31,14 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 # Pipeline:
 #
 # Remote MySQL
-#       ↓
-# Sqoop
-#       ↓
-# /security_lab/s3_staging
-#       ↓
-# SHA-256 hash-chain generation
-#       ↓
-# AES-256-GCM encryption
-#       ↓
-# /security_lab/s3_build/part*
-#       ↓
-# Move encrypted part files only
-#       ↓
-# /security_lab/s3/part*
-#       ↓
-# HDFS Data Availability Check
+#   -> Sqoop
+#   -> /security_lab/s3_staging
+#   -> SHA-256 hash-chain generation
+#   -> AES-256-GCM encryption
+#   -> /security_lab/s3_build/part*
+#   -> move encrypted part files only
+#   -> /security_lab/s3/part*
+#   -> HDFS Data Availability Check
 #
 # ==========================================================
 
@@ -77,37 +70,26 @@ SOURCE_TABLE = os.getenv(
 # HDFS Paths - S3 ONLY
 # ==========================================================
 
-# Temporary raw Sqoop data
 HDFS_STAGING = (
     "/security_lab/s3_staging"
 )
 
-# Temporary protected/encrypted build
 HDFS_BUILD = (
     "/security_lab/s3_build"
 )
 
-# FINAL S3 target
-#
-# IMPORTANT:
-# This directory must be created manually.
 HDFS_TARGET = (
     "/security_lab/s3"
 )
 
 
 # ==========================================================
-# Integrity Configuration
+# Integrity + Confidentiality Configuration
 # ==========================================================
 
 HASH_ALGORITHM = "SHA-256"
 
 GENESIS_HASH = "GENESIS"
-
-
-# ==========================================================
-# Confidentiality Configuration
-# ==========================================================
 
 ENCRYPTION_ALGORITHM = (
     "AES-256-GCM"
@@ -175,8 +157,6 @@ if not REMOTE_DB_PASSWORD:
         "is not set."
     )
 
-    print()
-
     print(
         "Example:"
     )
@@ -194,8 +174,6 @@ if not SOURCE_TABLE:
     print(
         "ERROR: SOURCE_TABLE is not set."
     )
-
-    print()
 
     print(
         "Choose one:"
@@ -223,8 +201,6 @@ if SOURCE_TABLE not in DATASETS:
         f"{SOURCE_TABLE}"
     )
 
-    print()
-
     print(
         "Allowed experimental tables:"
     )
@@ -249,12 +225,6 @@ if not AES_KEY_B64:
     print(
         "ERROR: S3_AES_KEY_B64 "
         "is not set."
-    )
-
-    print()
-
-    print(
-        "Example:"
     )
 
     print(
@@ -318,8 +288,47 @@ EXPECTED_RECORDS = (
 
 
 # ==========================================================
-# Indicator 12
-# Security Event Logging
+# Audit Log Initialization
+# ==========================================================
+
+def initialize_audit_log():
+    """
+    Create the S3 audit log if it does not exist.
+
+    If the log already exists, preserve its existing
+    contents. Later audit_event() calls append new records.
+    """
+
+    directory = (
+        os.path.dirname(
+            AUDIT_LOG
+        )
+    )
+
+
+    if directory:
+
+        os.makedirs(
+            directory,
+            exist_ok=True
+        )
+
+
+    # Append mode:
+    #
+    # Missing file -> create
+    # Existing file -> preserve
+    #
+    with open(
+        AUDIT_LOG,
+        "a",
+        encoding="utf-8"
+    ):
+        pass
+
+
+# ==========================================================
+# Indicator 12 - Security Event Logging
 # ==========================================================
 
 def audit_event(
@@ -386,6 +395,11 @@ def audit_event(
             )
 
 
+        # "a" means:
+        #
+        # create when missing
+        # append when existing
+        #
         with open(
             AUDIT_LOG,
             "a",
@@ -737,7 +751,7 @@ def get_hdfs_part_files(
             )
 
 
-    # Deterministic ordering is important
+    # Deterministic ordering is required
     # for the sequential hash chain.
 
     files.sort()
@@ -755,16 +769,7 @@ def get_hdfs_part_files(
 
 
 # ==========================================================
-# MANUAL S3 TARGET VALIDATION
-# ==========================================================
-#
-# /security_lab/s3 must already exist.
-#
-# The script DOES NOT create it.
-#
-# The directory must also be EMPTY before
-# an official normal experiment run.
-#
+# Manual S3 Target Validation
 # ==========================================================
 
 def validate_manual_s3_target(
@@ -772,7 +777,7 @@ def validate_manual_s3_target(
 ):
 
     # ------------------------------------------------------
-    # Check path exists
+    # Check that /security_lab/s3 exists
     # ------------------------------------------------------
 
     result = subprocess.run(
@@ -818,7 +823,7 @@ def validate_manual_s3_target(
 
 
     # ------------------------------------------------------
-    # Check that it is accessible and empty
+    # Check that it is accessible and EMPTY
     # ------------------------------------------------------
 
     result = subprocess.run(
@@ -901,7 +906,7 @@ def check_hdfs_availability(
 ):
 
     # ------------------------------------------------------
-    # Check final S3 dataset path exists
+    # Check dataset path exists
     # ------------------------------------------------------
 
     result = subprocess.run(
@@ -926,7 +931,7 @@ def check_hdfs_availability(
 
 
     # ------------------------------------------------------
-    # Check final S3 dataset can be listed
+    # Check dataset can be listed
     # ------------------------------------------------------
 
     result = subprocess.run(
@@ -953,7 +958,7 @@ def check_hdfs_availability(
 
 
     # ------------------------------------------------------
-    # Check final S3 dataset contains part files
+    # Check dataset contains part files
     # ------------------------------------------------------
 
     part_files = []
@@ -1014,14 +1019,6 @@ def check_hdfs_availability(
 # ==========================================================
 # Reset TEMPORARY S3 Paths Only
 # ==========================================================
-#
-# IMPORTANT:
-#
-# This function DOES NOT touch:
-#
-# /security_lab/s3
-#
-# ==========================================================
 
 def reset_s3_environment():
 
@@ -1037,6 +1034,10 @@ def reset_s3_environment():
         "=" * 72
     )
 
+
+    # IMPORTANT:
+    #
+    # Do NOT remove /security_lab/s3.
 
     hdfs_remove(
         HDFS_STAGING
@@ -1140,10 +1141,6 @@ def generate_encrypted_dataset():
     )
 
 
-    # ------------------------------------------------------
-    # Get raw Sqoop files
-    # ------------------------------------------------------
-
     part_files = (
         get_hdfs_part_files(
             HDFS_STAGING
@@ -1151,11 +1148,7 @@ def generate_encrypted_dataset():
     )
 
 
-    # ------------------------------------------------------
-    # Create temporary build directory
-    #
-    # This is NOT /security_lab/s3.
-    # ------------------------------------------------------
+    # Temporary build directory only.
 
     hdfs_mkdir(
         HDFS_BUILD
@@ -1197,10 +1190,6 @@ def generate_encrypted_dataset():
         )
 
 
-        # --------------------------------------------------
-        # Read raw Sqoop records
-        # --------------------------------------------------
-
         reader = subprocess.Popen(
             [
                 "hdfs",
@@ -1215,10 +1204,6 @@ def generate_encrypted_dataset():
             bufsize=1
         )
 
-
-        # --------------------------------------------------
-        # Write encrypted records to temporary build
-        # --------------------------------------------------
 
         writer = subprocess.Popen(
             [
@@ -1284,7 +1269,7 @@ def generate_encrypted_dataset():
 
 
                 # ==========================================
-                # Store encrypted record
+                # Write encrypted record
                 # ==========================================
 
                 writer.stdin.write(
@@ -1292,10 +1277,6 @@ def generate_encrypted_dataset():
                     + "\n"
                 )
 
-
-                # ==========================================
-                # Advance chain
-                # ==========================================
 
                 previous_hash = (
                     current_hash
@@ -1360,7 +1341,7 @@ def generate_encrypted_dataset():
 
 
     # ======================================================
-    # Verify Protected Record Count
+    # Verify Record Count
     # ======================================================
 
     if (
@@ -1377,18 +1358,7 @@ def generate_encrypted_dataset():
 
 
     # ======================================================
-    # Move encrypted PART FILES ONLY
-    # into manually created /security_lab/s3
-    #
-    # IMPORTANT:
-    #
-    # HDFS_TARGET already exists.
-    #
-    # We do NOT:
-    #
-    #   hdfs dfs -mv s3_build s3
-    #
-    # because that would create/manage the target.
+    # Move encrypted part files into MANUAL target
     # ======================================================
 
     build_part_files = (
@@ -1428,9 +1398,7 @@ def generate_encrypted_dataset():
             )
 
 
-    # ------------------------------------------------------
-    # Remove now-empty build directory
-    # ------------------------------------------------------
+    # Remove temporary build directory.
 
     hdfs_remove(
         HDFS_BUILD
@@ -1571,6 +1539,31 @@ print()
 # Not included in experimental performance timing.
 # ==========================================================
 
+# ----------------------------------------------------------
+# Initialize audit log BEFORE HDFS validation.
+#
+# Missing file:
+#     create
+#
+# Existing file:
+#     preserve and append
+# ----------------------------------------------------------
+
+try:
+
+    initialize_audit_log()
+
+
+except Exception as exc:
+
+    print(
+        "ERROR: Unable to initialize "
+        f"S3 audit log: {exc}"
+    )
+
+    sys.exit(1)
+
+
 reset_s3_environment()
 
 
@@ -1622,6 +1615,41 @@ try:
 
 except Exception as exc:
 
+    # ------------------------------------------------------
+    # The audit file already exists now.
+    #
+    # Record the HDFS target validation failure.
+    # ------------------------------------------------------
+
+    try:
+
+        audit_event(
+            "HDFS_TARGET_VALIDATION",
+            "FAIL",
+            "BLOCK",
+            "MANUAL_HDFS_TARGET_INVALID",
+            (
+                str(exc)
+                .replace(
+                    "\t",
+                    " "
+                )
+                .replace(
+                    "\n",
+                    " "
+                )
+            )
+        )
+
+
+    except Exception as log_exc:
+
+        print(
+            "AUDIT ERROR: "
+            f"{log_exc}"
+        )
+
+
     print()
 
 
@@ -1664,6 +1692,12 @@ except Exception as exc:
     )
 
 
+    print(
+        f"Failure recorded in audit log: "
+        f"{AUDIT_LOG}"
+    )
+
+
     sys.exit(1)
 
 
@@ -1688,38 +1722,29 @@ monitor_thread.start()
 
 sqoop_returncode = 1
 
-
 sqoop_ingestion_time = 0.0
-
 
 security_status = (
     "NOT RUN"
 )
 
-
 protected_records = 0
-
 
 final_chain_hash = (
     "N/A"
 )
 
-
 hash_encrypt_time = 0.0
 
-
 hdfs_availability_time = 0.0
-
 
 hdfs_availability_status = (
     "NOT RUN"
 )
 
-
 hdfs_availability_reason = (
     "N/A"
 )
-
 
 hdfs_part_count = 0
 
@@ -1971,7 +1996,7 @@ try:
 
 
     print(
-        f"HDFS availability reason: "
+        "HDFS availability reason: "
         f"{reason}"
     )
 
@@ -2052,15 +2077,11 @@ except Exception as exc:
         )
 
 
-    # ------------------------------------------------------
     # IMPORTANT:
     #
-    # Do NOT delete HDFS_TARGET.
+    # Do NOT delete /security_lab/s3.
     #
-    # /security_lab/s3 is manually managed.
-    #
-    # Only temporary build data is cleaned.
-    # ------------------------------------------------------
+    # Only temporary build data is removed.
 
     hdfs_remove(
         HDFS_BUILD
@@ -2069,9 +2090,7 @@ except Exception as exc:
 
 finally:
 
-    # ------------------------------------------------------
-    # Raw plaintext Sqoop staging is always removed.
-    # ------------------------------------------------------
+    # Raw plaintext staging is always removed.
 
     hdfs_remove(
         HDFS_STAGING
