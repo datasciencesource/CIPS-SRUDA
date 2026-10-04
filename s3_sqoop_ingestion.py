@@ -1,110 +1,96 @@
-print(
-    f"Script 1 total measured time          : "
-    f"{script1_total_measured_time:.2f} seconds"
+import base64
+import hashlib
+import os
+import subprocess
+import sys
+import threading
+import time
+from datetime import datetime
+
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+
+# ==========================================================
+# S3 - PROTECTED SQOOP INGESTION
+# ==========================================================
+#
+# IMPORTANT:
+# /security_lab/s3 is MANUALLY managed.
+#
+# This script:
+#   - DOES NOT create /security_lab/s3
+#   - DOES NOT delete /security_lab/s3
+#   - CREATES the audit log if it does not exist
+#   - APPENDS to the audit log if it already exists
+#
+# Before a normal run:
+#
+#   hdfs dfs -rm -r -f /security_lab/s3
+#   hdfs dfs -mkdir -p /security_lab/s3
+#
+# Pipeline:
+#
+# Remote MySQL
+#   -> Sqoop
+#   -> /security_lab/s3_staging
+#   -> SHA-256 hash-chain generation
+#   -> AES-256-GCM encryption
+#   -> /security_lab/s3_build/part*
+#   -> move encrypted part files only
+#   -> /security_lab/s3/part*
+#   -> HDFS Data Availability Check
+#
+# ==========================================================
+
+
+STRATEGY = "S3"
+
+
+# ==========================================================
+# Remote MySQL Configuration
+# ==========================================================
+
+REMOTE_DB = (
+    "jdbc:mysql://69.175.69.34/"
+    "sumrachna_hd"
 )
 
+REMOTE_DB_USER = "sumrachna_hd"
 
-print()
-
-
-# ----------------------------------------------------------
-# Resource Utilization
-# ----------------------------------------------------------
-
-print(
-    f"Average CPU utilization               : "
-    f"{average_cpu:.2f}%"
+REMOTE_DB_PASSWORD = os.getenv(
+    "REMOTE_DB_PASSWORD"
 )
 
-
-print(
-    f"Peak CPU utilization                  : "
-    f"{peak_cpu:.2f}%"
-)
-
-
-print(
-    f"Average memory utilization            : "
-    f"{average_memory:.2f}%"
-)
-
-
-print(
-    f"Peak memory utilization               : "
-    f"{peak_memory:.2f}%"
-)
-
-
-print(
-    f"HDFS encrypted storage size           : "
-    f"{hdfs_size_mb:.4f} MB"
-)
-
-
-print()
-
-
-# ----------------------------------------------------------
-# Security Details
-# ----------------------------------------------------------
-
-print(
-    f"Hash algorithm                        : "
-    f"{HASH_ALGORITHM}"
-)
-
-
-print(
-    f"Genesis previous hash                 : "
-    f"{GENESIS_HASH}"
-)
-
-
-print(
-    f"Final chain hash                      : "
-    f"{final_chain_hash}"
-)
-
-
-print(
-    f"Encryption algorithm                  : "
-    f"{ENCRYPTION_ALGORITHM}"
-)
-
-
-print(
-    f"AES key size                          : "
-    f"{len(AES_KEY) * 8} bits"
-)
-
-
-print(
-    f"Final encrypted dataset               : "
-    f"{HDFS_TARGET}/part*"
-)
-
-
-print(
-    f"S3 target management                  : "
-    f"MANUAL"
-)
-
-
-print(
-    f"Audit log                             : "
-    f"{AUDIT_LOG}"
-)
-
-
-print(
-    "=" * 72
+SOURCE_TABLE = os.getenv(
+    "SOURCE_TABLE"
 )
 
 
 # ==========================================================
-# Exit
+# HDFS Paths - S3 ONLY
 # ==========================================================
 
-sys.exit(
-    final_returncode
+HDFS_STAGING = (
+    "/security_lab/s3_staging"
+)
+
+HDFS_BUILD = (
+    "/security_lab/s3_build"
+)
+
+HDFS_TARGET = (
+    "/security_lab/s3"
+)
+
+
+# ==========================================================
+# Integrity + Confidentiality Configuration
+# ==========================================================
+
+HASH_ALGORITHM = "SHA-256"
+
+GENESIS_HASH = "GENESIS"
+
+ENCRYPTION_ALGORITHM = (
+    "AES-256-GCM"
 )
