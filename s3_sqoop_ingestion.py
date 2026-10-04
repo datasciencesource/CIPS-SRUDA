@@ -1627,7 +1627,7 @@ except Exception as exc:
             "HDFS_TARGET_VALIDATION",
             "FAIL",
             "BLOCK",
-            "MANUAL_HDFS_TARGET_INVALID",
+            "HDFS_TARGET_INVALID",
             (
                 str(exc)
                 .replace(
