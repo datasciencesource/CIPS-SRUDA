@@ -6,6 +6,7 @@ import tempfile
 import threading
 import time
 from datetime import datetime
+from pathlib import Path
 
 from pyspark import StorageLevel
 from pyspark.sql import SparkSession
@@ -152,7 +153,12 @@ def verify_hash_chain(decrypted_file):
             if not line:
                 continue
 
-            original_row, stored_hash = line.rsplit(",", 1)
+            try:
+                original_row, stored_hash = line.rsplit(",", 1)
+            except ValueError:
+                raise RuntimeError(
+                    "Hash value is missing from an S2 record."
+                )
 
             calculated_hash = hashlib.sha256(
                 f"{previous_hash}|{original_row}".encode("utf-8")
@@ -180,6 +186,7 @@ def verify_hash_chain(decrypted_file):
 
 spark = None
 monitor_thread = None
+decrypted_file = None
 
 status = "SUCCESS"
 error_message = "N/A"
@@ -218,6 +225,8 @@ try:
 
     processing_start = time.perf_counter()
 
+    local_file_uri = Path(decrypted_file).resolve().as_uri()
+
     data = (
         spark.read
         .schema(
@@ -233,7 +242,7 @@ try:
         .option("header", "false")
         .option("timestampFormat", "yyyy-MM-dd HH:mm:ss.S")
         .option("mode", "FAILFAST")
-        .csv(decrypted_file)
+        .csv(local_file_uri)
         .persist(StorageLevel.MEMORY_AND_DISK)
     )
 
@@ -242,7 +251,8 @@ try:
 
     if records != EXPECTED_RECORDS:
         raise RuntimeError(
-            f"Expected {EXPECTED_RECORDS} records but found {records}"
+            f"Expected {EXPECTED_RECORDS} records "
+            f"but found {records}"
         )
 
     verification_time, verified_records = verify_hash_chain(
@@ -267,8 +277,6 @@ try:
 
     mysql_time = time.perf_counter() - mysql_start
 
-    os.unlink(decrypted_file)
-
 except Exception as exc:
     status = "FAILED"
     error_message = str(exc)
@@ -278,6 +286,9 @@ finally:
 
     if monitor_thread is not None:
         monitor_thread.join()
+
+    if decrypted_file and os.path.exists(decrypted_file):
+        os.unlink(decrypted_file)
 
     if spark is not None:
         spark.stop()
@@ -309,31 +320,44 @@ print(f"S2-Script-2 total time                : {s2_script2_time:.2f} seconds")
 print(f"PySpark processing component          : {pyspark_time:.2f} seconds")
 print(f"Hash-verification time                : {verification_time:.2f} seconds")
 print(f"Local MySQL write time                : {mysql_time:.2f} seconds")
+
 print(f"Output records                        : {records}")
 print(f"Verified records                      : {verified_records}")
+
 print(
-    f"Hash-chain verification               : "
+    "Hash-chain verification               : "
     f"{'PASS' if status == 'SUCCESS' else 'FAIL'}"
 )
+
 print(
-    f"Encryption/decryption verification   : "
+    "Encryption/decryption verification   : "
     f"{'PASS' if status == 'SUCCESS' else 'FAIL'}"
 )
+
 print(
-    f"Local MySQL output verified            : "
+    "HDFS output verified                  : "
     f"{'PASS' if status == 'SUCCESS' else 'FAIL'}"
 )
+
 print(
-    f"Overall pipeline verification          : "
+    "Local MySQL output verified            : "
     f"{'PASS' if status == 'SUCCESS' else 'FAIL'}"
 )
+
+print(
+    "Overall pipeline verification          : "
+    f"{'PASS' if status == 'SUCCESS' else 'FAIL'}"
+)
+
 print("Retry required                        : NO")
 print("Number of retries                     : 0")
 print(f"Error / failure message               : {error_message}")
+
 print(
     "Abnormal condition observed           : "
     f"{'NO' if status == 'SUCCESS' else 'YES'}"
 )
+
 print(f"Average CPU utilization               : {average(cpu_samples):.2f}%")
 print(
     f"Peak CPU utilization                  : "
@@ -347,12 +371,14 @@ print(
     f"Peak memory utilization               : "
     f"{max(memory_samples) if memory_samples else 0.0:.2f}%"
 )
+
 print("S0 baseline workflow                  : RETAINED")
 print("S1 hash-chain protection              : RETAINED")
 print(
     "S2 encryption protection              : "
     f"{'PASS' if status == 'SUCCESS' else 'FAIL'}"
 )
+
 print("=" * 72)
 
 sys.exit(0 if status == "SUCCESS" else 1)
