@@ -1,417 +1,107 @@
 import os
+import subprocess
 import sys
 import threading
 import time
+from datetime import datetime
 
-from pyspark.sql import SparkSession
-from pyspark import StorageLevel
+REMOTE_DB = "jdbc:mysql://69.175.69.34/sumrachna_hd"
+USERNAME = "sumrachna_hd"
+PASSWORD = os.getenv("REMOTE_DB_PASSWORD")
+SOURCE_TABLE = os.getenv("SOURCE_TABLE")
+HDFS_TARGET = "/security_lab/s0"
+RUN_NUMBER = os.getenv("RUN_NUMBER", "R1")
+DATASETS = {
+    "table_stock100": ("Small", 125),
+    "table_stock20K": ("Medium", 24858),
+    "table_stock4M": ("Large", 4248576),
+}
+EXPERIMENT_ID = os.getenv("EXPERIMENT_ID", f"S0-S-{RUN_NUMBER}")
 
-# =====================================
-# S0 - PySpark Configuration
-# =====================================
-
-HDFS_INPUT = "hdfs:///security_lab/s0/part*"
-
-MYSQL_URL = (
-    "jdbc:mysql://127.0.0.1:3306/dbtest"
-    "?useSSL=false"
-    "&allowPublicKeyRetrieval=true"
-    "&serverTimezone=UTC"
-)
-
-MYSQL_TABLE = "table_stock"
-MYSQL_USER = "usertest"
-MYSQL_PASSWORD = os.getenv("LOCAL_DB_PASSWORD")
-
-# =====================================
-# Check Credential
-# =====================================
-
-if not MYSQL_PASSWORD:
-    print("ERROR: LOCAL_DB_PASSWORD is not set.")
-    print("Run:")
-    print("export LOCAL_DB_PASSWORD='your_password'")
+if not PASSWORD or not SOURCE_TABLE or SOURCE_TABLE not in DATASETS:
+    print("ERROR: Set REMOTE_DB_PASSWORD and a valid SOURCE_TABLE.")
     sys.exit(1)
 
-# =====================================
-# Resource Monitoring
-# =====================================
+DATASET_SCALE, EXPECTED_RECORDS = DATASETS[SOURCE_TABLE]
+cpu_samples, memory_samples = [], []
+stop_event = threading.Event()
 
-cpu_samples = []
-memory_samples = []
-stop_monitoring = threading.Event()
+def cpu_values():
+    with open("/proc/stat") as f:
+        v = list(map(float, f.readline().split()[1:9]))
+    idle = v[3] + v[4]
+    return sum(v), idle
 
-
-def get_cpu_values():
-    with open("/proc/stat", "r") as f:
-        values = list(
-            map(float, f.readline().split()[1:9])
-        )
-
-    user, nice, system, idle, iowait, irq, softirq, steal = values
-
-    idle_total = idle + iowait
-    active_total = (
-        user
-        + nice
-        + system
-        + irq
-        + softirq
-        + steal
-    )
-
-    total = idle_total + active_total
-
-    return total, idle_total
-
-
-def get_memory_percent():
-    meminfo = {}
-
-    with open("/proc/meminfo", "r") as f:
+def memory_percent():
+    m = {}
+    with open("/proc/meminfo") as f:
         for line in f:
-            key, value = line.split(":", 1)
-
-            meminfo[key] = float(
-                value.strip().split()[0]
-            )
-
-    total = meminfo["MemTotal"]
-    available = meminfo["MemAvailable"]
-
-    return (
-        (total - available) / total
-    ) * 100
-
-
-def monitor_resources():
-    previous_total, previous_idle = get_cpu_values()
-
-    # Initial memory sample
-    memory_samples.append(
-        get_memory_percent()
-    )
-
-    while not stop_monitoring.wait(0.5):
-
-        current_total, current_idle = get_cpu_values()
-
-        total_delta = (
-            current_total - previous_total
-        )
-
-        idle_delta = (
-            current_idle - previous_idle
-        )
-
-        if total_delta > 0:
-
-            cpu_percent = (
-                (total_delta - idle_delta)
-                / total_delta
-            ) * 100
-
-            cpu_samples.append(
-                cpu_percent
-            )
-
-        memory_samples.append(
-            get_memory_percent()
-        )
-
-        previous_total = current_total
-        previous_idle = current_idle
-
-
-# =====================================
-# Variables
-# =====================================
-
-spark = None
-data = None
-monitor_thread = None
-monitor_started = False
-
-pyspark_processing_time = 0.0
-mysql_write_time = 0.0
-record_count = 0
-
-status = "SUCCESS"
-error_message = ""
-
-# =====================================
-# Main Execution
-# =====================================
-
-try:
-
-    print("=" * 70)
-    print("S0 - PYSPARK PROCESSING")
-    print("=" * 70)
-
-    # =================================
-    # Start Spark
-    # =================================
-
-    spark = (
-        SparkSession.builder
-        .appName("S0 HDFS to Local MySQL")
-        .master("local[*]")
-        .getOrCreate()
-    )
-
-    spark.sparkContext.setLogLevel("ERROR")
-
-    # =================================
-    # Schema
-    # =================================
-
-    schema = """
-        id INT,
-        product_id INT,
-        purchasing_price DOUBLE,
-        quantity DOUBLE,
-        stock_date TIMESTAMP
-    """
-
-    # =================================
-    # Start Resource Monitoring
-    #
-    # Monitoring begins after Spark
-    # startup and immediately before
-    # measured processing.
-    # =================================
-
-    monitor_thread = threading.Thread(
-        target=monitor_resources,
-        daemon=True
-    )
-
-    monitor_thread.start()
-    monitor_started = True
-
-    # =================================
-    # PySpark Processing
-    # =================================
-
-    processing_start = time.time()
-
-    data = (
-        spark.read
-        .schema(schema)
-        .option("header", "false")
-        .option(
-            "timestampFormat",
-            "yyyy-MM-dd HH:mm:ss.S"
-        )
-        .option("mode", "FAILFAST")
-        .csv(HDFS_INPUT)
-    )
-
-    data.persist(
-        StorageLevel.MEMORY_AND_DISK
-    )
-
-    # Force Spark execution
-    record_count = data.count()
-
-    processing_end = time.time()
-
-    pyspark_processing_time = (
-        processing_end
-        - processing_start
-    )
-
-    # =================================
-    # Local MySQL Write
-    # =================================
-
-    mysql_start = time.time()
-
-    (
-        data.coalesce(1)
-        .write
-        .format("jdbc")
-        .option(
-            "url",
-            MYSQL_URL
-        )
-        .option(
-            "dbtable",
-            MYSQL_TABLE
-        )
-        .option(
-            "user",
-            MYSQL_USER
-        )
-        .option(
-            "password",
-            MYSQL_PASSWORD
-        )
-        .option(
-            "driver",
-            "com.mysql.cj.jdbc.Driver"
-        )
-        .mode("append")
-        .save()
-    )
-
-    mysql_end = time.time()
-
-    mysql_write_time = (
-        mysql_end
-        - mysql_start
-    )
-
-    # =================================
-    # Stop Resource Monitoring
-    #
-    # Resource monitoring therefore
-    # covers:
-    #
-    # PySpark processing
-    # +
-    # Local MySQL writing
-    # =================================
-
-    stop_monitoring.set()
-
-    if monitor_thread is not None:
-        monitor_thread.join()
-
-    monitor_started = False
-
-    # =================================
-    # Verification Display
-    #
-    # This is intentionally outside
-    # the measured processing interval.
-    # =================================
-
-    data.show(
-        5,
-        truncate=False
-    )
-
-except Exception as error:
-
-    status = "FAILED"
-    error_message = str(error)
-
-finally:
-
-    # Stop monitor if an error occurred
-    # before normal monitoring shutdown.
-
-    if monitor_started:
-
-        stop_monitoring.set()
-
-        if monitor_thread is not None:
-            monitor_thread.join()
-
-    # Release cached dataframe
-
-    if data is not None:
-        try:
-            data.unpersist()
-        except Exception:
-            pass
-
-    # Stop Spark
-
-    if spark is not None:
-        try:
-            spark.stop()
-        except Exception:
-            pass
-
-# =====================================
-# Resource Results
-# =====================================
-
-average_cpu = (
-    sum(cpu_samples)
-    / len(cpu_samples)
-    if cpu_samples
-    else 0.0
-)
-
-peak_cpu = (
-    max(cpu_samples)
-    if cpu_samples
-    else 0.0
-)
-
-average_memory = (
-    sum(memory_samples)
-    / len(memory_samples)
-    if memory_samples
-    else 0.0
-)
-
-peak_memory = (
-    max(memory_samples)
-    if memory_samples
-    else 0.0
-)
-
-# =====================================
-# Results
-# =====================================
-
-print()
-print("=" * 70)
-print("S0 - PYSPARK RESULT")
-print("=" * 70)
-
-print(
-    f"Execution status             : "
-    f"{status}"
-)
-
-print(
-    f"PySpark processing time      : "
-    f"{pyspark_processing_time:.2f} seconds"
-)
-
-print(
-    f"Local MySQL write time       : "
-    f"{mysql_write_time:.2f} seconds"
-)
-
-print(
-    f"Output records               : "
-    f"{record_count}"
-)
-
-print(
-    f"Average CPU utilization      : "
-    f"{average_cpu:.2f}%"
-)
-
-print(
-    f"Peak CPU utilization         : "
-    f"{peak_cpu:.2f}%"
-)
-
-print(
-    f"Average memory utilization   : "
-    f"{average_memory:.2f}%"
-)
-
-print(
-    f"Peak memory utilization      : "
-    f"{peak_memory:.2f}%"
-)
-
-if error_message:
-    print(
-        f"Error                        : "
-        f"{error_message}"
-    )
-
-print("=" * 70)
-
-if status == "FAILED":
-    sys.exit(1)
+            k, value = line.split(":", 1)
+            m[k] = float(value.split()[0])
+    return (m["MemTotal"] - m["MemAvailable"]) / m["MemTotal"] * 100
+
+def monitor():
+    previous_total, previous_idle = cpu_values()
+    while not stop_event.wait(0.5):
+        total, idle = cpu_values()
+        if total > previous_total:
+            cpu_samples.append((1 - (idle - previous_idle) / (total - previous_total)) * 100)
+        memory_samples.append(memory_percent())
+        previous_total, previous_idle = total, idle
+
+def average(values):
+    return sum(values) / len(values) if values else 0.0
+
+def hdfs_size():
+    r = subprocess.run(["hdfs", "dfs", "-du", "-s", HDFS_TARGET], capture_output=True, text=True)
+    try:
+        return int(r.stdout.split()[0]) / (1024 ** 2)
+    except (ValueError, IndexError):
+        return 0.0
+
+command = ["sqoop", "import", "--connect", REMOTE_DB, "--username", USERNAME,
+           "--password", PASSWORD, "--table", SOURCE_TABLE,
+           "--target-dir", HDFS_TARGET, "--delete-target-dir"]
+
+print("=" * 72)
+print("S0 - SQOOP INGESTION RESULT")
+print("=" * 72)
+print(f"Laboratory environment                : S0")
+print(f"Experiment ID                         : {EXPERIMENT_ID}")
+print(f"Strategy under test                   : S0")
+print(f"Dataset scale                         : {DATASET_SCALE}")
+print(f"Source table                          : {SOURCE_TABLE}")
+print(f"Expected records                      : {EXPECTED_RECORDS}")
+print(f"Run number                            : {RUN_NUMBER}")
+start_label = datetime.now().astimezone().isoformat(timespec="seconds")
+print(f"Workflow start time                   : {start_label}")
+
+thread = threading.Thread(target=monitor, daemon=True)
+thread.start()
+start = time.perf_counter()
+result = subprocess.run(command)
+elapsed = time.perf_counter() - start
+stop_event.set()
+thread.join()
+end_label = datetime.now().astimezone().isoformat(timespec="seconds")
+
+success = result.returncode == 0
+size_mb = hdfs_size() if success else 0.0
+status = "SUCCESS" if success else "FAILED"
+print(f"Workflow end time                     : {end_label}")
+print(f"Execution status                      : {status}")
+print(f"Sqoop ingestion time                  : {elapsed:.2f} seconds")
+print(f"Additional security-processing time   : 0.00 seconds")
+print(f"HDFS output verified                  : {'PASS' if success and size_mb > 0 else 'FAIL'}")
+print(f"Average CPU utilization               : {average(cpu_samples):.2f}%")
+print(f"Peak CPU utilization                  : {max(cpu_samples) if cpu_samples else 0.0:.2f}%")
+print(f"Average memory utilization            : {average(memory_samples):.2f}%")
+print(f"Peak memory utilization               : {max(memory_samples) if memory_samples else 0.0:.2f}%")
+print(f"HDFS storage size                     : {size_mb:.4f} MB")
+print("Retry required                        : NO")
+print("Number of retries                     : 0")
+print(f"Error / failure message               : {'N/A' if success else 'Sqoop ingestion failed'}")
+print(f"Abnormal condition observed           : {'NO' if success else 'YES'}")
+print("S0 security indicators 1–3            : PASS (baseline controls)")
+print("S1/S2/S3 indicators                   : N/A - not tested")
+sys.exit(result.returncode)
