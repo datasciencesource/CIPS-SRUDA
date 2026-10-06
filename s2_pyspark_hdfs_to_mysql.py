@@ -1,3 +1,4 @@
+import base64
 import hashlib
 import os
 import subprocess
@@ -8,6 +9,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from pyspark import StorageLevel
 from pyspark.sql import SparkSession
 
@@ -25,7 +27,7 @@ MYSQL_TABLE = "table_stock"
 MYSQL_USER = "usertest"
 MYSQL_PASSWORD = os.getenv("LOCAL_DB_PASSWORD")
 SOURCE_TABLE = os.getenv("SOURCE_TABLE")
-ENCRYPTION_KEY = os.getenv("S2_ENCRYPTION_KEY")
+S2_AES_KEY_B64 = os.getenv("S2_AES_KEY_B64")
 
 DATASETS = {
     "table_stock100": ("Small", 125),
@@ -41,8 +43,18 @@ if not SOURCE_TABLE or SOURCE_TABLE not in DATASETS:
     print("ERROR: Set a valid SOURCE_TABLE.")
     sys.exit(1)
 
-if not ENCRYPTION_KEY:
-    print("ERROR: Set S2_ENCRYPTION_KEY.")
+if not S2_AES_KEY_B64:
+    print("ERROR: Set S2_AES_KEY_B64.")
+    sys.exit(1)
+
+try:
+    AES_KEY = base64.b64decode(S2_AES_KEY_B64, validate=True)
+
+    if len(AES_KEY) != 32:
+        raise ValueError
+
+except Exception:
+    print("ERROR: S2_AES_KEY_B64 must decode to 32 bytes.")
     sys.exit(1)
 
 DATASET_SCALE, EXPECTED_RECORDS = DATASETS[SOURCE_TABLE]
@@ -116,28 +128,24 @@ def decrypt_hdfs_file():
         check=True
     )
 
-    environment = os.environ.copy()
-    environment["S2_KEY"] = ENCRYPTION_KEY
+    with open(encrypted_file, "rb") as source:
+        nonce = source.read(12)
+        ciphertext = source.read()
 
-    subprocess.run(
-        [
-            "openssl",
-            "enc",
-            "-d",
-            "-aes-256-cbc",
-            "-pbkdf2",
-            "-in",
-            encrypted_file,
-            "-out",
-            decrypted_file,
-            "-pass",
-            "env:S2_KEY"
-        ],
-        env=environment,
-        check=True
+    if len(nonce) != 12 or not ciphertext:
+        raise RuntimeError("Invalid encrypted S2 HDFS file.")
+
+    plaintext = AESGCM(AES_KEY).decrypt(
+        nonce,
+        ciphertext,
+        None
     )
 
+    with open(decrypted_file, "wb") as target:
+        target.write(plaintext)
+
     os.unlink(encrypted_file)
+
     return decrypted_file
 
 
@@ -146,8 +154,8 @@ def verify_hash_chain(decrypted_file):
     previous_hash = "GENESIS"
     verified_records = 0
 
-    with open(decrypted_file, "r", encoding="utf-8") as file:
-        for line in file:
+    with open(decrypted_file, "r", encoding="utf-8") as source:
+        for line in source:
             line = line.strip()
 
             if not line:
@@ -206,7 +214,7 @@ start_label = datetime.now().astimezone().isoformat(
 try:
     spark = (
         SparkSession.builder
-        .appName("S2 Encrypted HDFS to Local MySQL")
+        .appName("S2 AES-GCM HDFS Verification to Local MySQL")
         .master("local[*]")
         .getOrCreate()
     )
@@ -223,9 +231,11 @@ try:
     decrypted_file = decrypt_hdfs_file()
     decryption_time = time.perf_counter() - decryption_start
 
-    processing_start = time.perf_counter()
+    local_file_uri = Path(
+        decrypted_file
+    ).resolve().as_uri()
 
-    local_file_uri = Path(decrypted_file).resolve().as_uri()
+    processing_start = time.perf_counter()
 
     data = (
         spark.read
@@ -312,73 +322,58 @@ print(f"Source table                          : {SOURCE_TABLE}")
 print(f"Workflow start time                   : {start_label}")
 print(f"Workflow end time                     : {end_label}")
 print(f"Execution status                      : {status}")
-
 print(f"S0-Script-2 time                      : {s0_script2_time:.2f} seconds")
 print(f"S1-Script-2 total time                : {s1_script2_time:.2f} seconds")
-print(f"Decryption time                       : {decryption_time:.2f} seconds")
+print(f"AES-GCM decryption time               : {decryption_time:.2f} seconds")
 print(f"S2-Script-2 total time                : {s2_script2_time:.2f} seconds")
 print(f"PySpark processing component          : {pyspark_time:.2f} seconds")
 print(f"Hash-verification time                : {verification_time:.2f} seconds")
 print(f"Local MySQL write time                : {mysql_time:.2f} seconds")
-
 print(f"Output records                        : {records}")
 print(f"Verified records                      : {verified_records}")
-
 print(
     "Hash-chain verification               : "
     f"{'PASS' if status == 'SUCCESS' else 'FAIL'}"
 )
-
 print(
-    "Encryption/decryption verification   : "
+    "AES-GCM decryption verification       : "
     f"{'PASS' if status == 'SUCCESS' else 'FAIL'}"
 )
-
 print(
     "HDFS output verified                  : "
     f"{'PASS' if status == 'SUCCESS' else 'FAIL'}"
 )
-
 print(
     "Local MySQL output verified            : "
     f"{'PASS' if status == 'SUCCESS' else 'FAIL'}"
 )
-
 print(
     "Overall pipeline verification          : "
     f"{'PASS' if status == 'SUCCESS' else 'FAIL'}"
 )
-
 print("Retry required                        : NO")
 print("Number of retries                     : 0")
 print(f"Error / failure message               : {error_message}")
-
 print(
     "Abnormal condition observed           : "
     f"{'NO' if status == 'SUCCESS' else 'YES'}"
 )
-
 print(f"Average CPU utilization               : {average(cpu_samples):.2f}%")
 print(
     f"Peak CPU utilization                  : "
     f"{max(cpu_samples) if cpu_samples else 0.0:.2f}%"
 )
-print(
-    f"Average memory utilization            : "
-    f"{average(memory_samples):.2f}%"
-)
+print(f"Average memory utilization            : {average(memory_samples):.2f}%")
 print(
     f"Peak memory utilization               : "
     f"{max(memory_samples) if memory_samples else 0.0:.2f}%"
 )
-
 print("S0 baseline workflow                  : RETAINED")
 print("S1 hash-chain protection              : RETAINED")
 print(
-    "S2 encryption protection              : "
+    "S2 AES-GCM protection                 : "
     f"{'PASS' if status == 'SUCCESS' else 'FAIL'}"
 )
-
 print("=" * 72)
 
 sys.exit(0 if status == "SUCCESS" else 1)
