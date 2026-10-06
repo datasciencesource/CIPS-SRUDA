@@ -21,7 +21,7 @@ DATASETS = {
     "table_stock4M": ("Large", 4248576),
 }
 
-if not PASSWORD or not SOURCE_TABLE or SOURCE_TABLE not in DATASETS:
+if not PASSWORD or SOURCE_TABLE not in DATASETS:
     print("ERROR: Set REMOTE_DB_PASSWORD and a valid SOURCE_TABLE.")
     sys.exit(1)
 
@@ -33,18 +33,17 @@ stop_event = threading.Event()
 
 
 def cpu_values():
-    with open("/proc/stat") as file:
-        values = list(map(float, file.readline().split()[1:9]))
+    with open("/proc/stat") as f:
+        values = list(map(float, f.readline().split()[1:9]))
 
-    idle = values[3] + values[4]
-    return sum(values), idle
+    return sum(values), values[3] + values[4]
 
 
 def memory_percent():
     values = {}
 
-    with open("/proc/meminfo") as file:
-        for line in file:
+    with open("/proc/meminfo") as f:
+        for line in f:
             key, value = line.split(":", 1)
             values[key] = float(value.split()[0])
 
@@ -56,23 +55,23 @@ def memory_percent():
 
 
 def monitor():
-    previous_total, previous_idle = cpu_values()
+    old_total, old_idle = cpu_values()
 
     while not stop_event.wait(0.5):
         total, idle = cpu_values()
 
-        if total > previous_total:
-            cpu_usage = (
-                1 - (idle - previous_idle)
-                / (total - previous_total)
-            ) * 100
-
-            cpu_samples.append(cpu_usage)
+        if total > old_total:
+            cpu_samples.append(
+                (
+                    1
+                    - (idle - old_idle)
+                    / (total - old_total)
+                )
+                * 100
+            )
 
         memory_samples.append(memory_percent())
-
-        previous_total = total
-        previous_idle = idle
+        old_total, old_idle = total, idle
 
 
 def average(values):
@@ -93,35 +92,25 @@ def hdfs_size(path):
 
 
 def generate_hash_chain():
-    """
-    Reads the raw Sqoop CSV files from HDFS and creates a new CSV file
-    containing the original data plus a SHA-256 chained hash.
-
-    Output format:
-
-    original_columns, row_hash
-    """
-
     start = time.perf_counter()
-
-    raw_command = [
-        "hdfs", "dfs", "-cat",
-        f"{RAW_HDFS_TARGET}/part*"
-    ]
+    previous_hash = "GENESIS"
+    record_count = 0
 
     with tempfile.NamedTemporaryFile(
         mode="w",
         delete=False,
-        prefix="s1_hash_chain_",
         suffix=".csv"
-    ) as output_file:
+    ) as output:
 
-        temporary_file = output_file.name
-        previous_hash = "GENESIS"
-        record_count = 0
+        temporary_file = output.name
 
         raw_process = subprocess.Popen(
-            raw_command,
+            [
+                "hdfs",
+                "dfs",
+                "-cat",
+                f"{RAW_HDFS_TARGET}/part*"
+            ],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True
@@ -137,20 +126,23 @@ def generate_hash_chain():
                 f"{previous_hash}|{row}".encode("utf-8")
             ).hexdigest()
 
-            output_file.write(f"{row},{current_hash}\n")
+            output.write(f"{row},{current_hash}\n")
 
             previous_hash = current_hash
             record_count += 1
 
         raw_process.stdout.close()
         raw_error = raw_process.stderr.read()
-        raw_return_code = raw_process.wait()
+        raw_code = raw_process.wait()
 
-    if raw_return_code != 0:
+    if raw_code != 0:
         os.unlink(temporary_file)
-        raise RuntimeError(
-            f"Unable to read raw HDFS data: {raw_error}"
-        )
+        raise RuntimeError(raw_error)
+
+    subprocess.run(
+        ["hdfs", "dfs", "-rm", "-r", "-f", HDFS_TARGET],
+        check=False
+    )
 
     subprocess.run(
         ["hdfs", "dfs", "-mkdir", "-p", HDFS_TARGET],
@@ -159,7 +151,10 @@ def generate_hash_chain():
 
     subprocess.run(
         [
-            "hdfs", "dfs", "-put", "-f",
+            "hdfs",
+            "dfs",
+            "-put",
+            "-f",
             temporary_file,
             f"{HDFS_TARGET}/part-00000"
         ],
@@ -168,19 +163,19 @@ def generate_hash_chain():
 
     os.unlink(temporary_file)
 
-    elapsed = time.perf_counter() - start
+    hash_time = time.perf_counter() - start
 
     if record_count != EXPECTED_RECORDS:
         raise RuntimeError(
-            f"Expected {EXPECTED_RECORDS} records after hashing "
+            f"Expected {EXPECTED_RECORDS} records "
             f"but found {record_count}"
         )
 
-    return elapsed, record_count
+    return hash_time, record_count
 
 
 print("=" * 72)
-print("S1 - SQOOP INGESTION WITH HASH-CHAIN RESULT")
+print("S1 - SQOOP INGESTION AND HASH-CHAIN RESULT")
 print("=" * 72)
 
 print("Laboratory environment                : S1")
@@ -199,7 +194,6 @@ monitor_thread = threading.Thread(
     target=monitor,
     daemon=True
 )
-
 monitor_thread.start()
 
 sqoop_command = [
@@ -222,21 +216,20 @@ sqoop_start = time.perf_counter()
 sqoop_result = subprocess.run(sqoop_command)
 sqoop_time = time.perf_counter() - sqoop_start
 
-hash_time = 0.0
-records = 0
 status = "FAILED"
 error_message = "N/A"
+hash_time = 0.0
+records = 0
 
 try:
     if sqoop_result.returncode != 0:
         raise RuntimeError("Sqoop ingestion failed.")
 
     hash_time, records = generate_hash_chain()
-
     status = "SUCCESS"
 
-except Exception as error:
-    error_message = str(error)
+except Exception as exc:
+    error_message = str(exc)
 
 stop_event.set()
 monitor_thread.join()
@@ -245,46 +238,60 @@ end_label = datetime.now().astimezone().isoformat(
     timespec="seconds"
 )
 
-raw_size_mb = hdfs_size(RAW_HDFS_TARGET)
-hashed_size_mb = hdfs_size(HDFS_TARGET)
-
-total_time = sqoop_time + hash_time
+s1_script1_time = sqoop_time + hash_time
+storage_size = hdfs_size(HDFS_TARGET)
 
 print(f"Workflow end time                     : {end_label}")
 print(f"Execution status                      : {status}")
-print(f"Sqoop ingestion time                  : {sqoop_time:.2f} seconds")
-print(f"Hash-chain processing time            : {hash_time:.2f} seconds")
-print(f"Total S1 Script-1 time                : {total_time:.2f} seconds")
-print(f"Additional security-processing time   : {hash_time:.2f} seconds")
+
 print(
-    "HDFS output verified                  : "
-    f"{'PASS' if status == 'SUCCESS' and hashed_size_mb > 0 else 'FAIL'}"
+    f"S0-Script-1 time                      : "
+    f"{sqoop_time:.2f} seconds"
 )
+
+print(
+    f"Hash-chain time                       : "
+    f"{hash_time:.2f} seconds"
+)
+
+print(
+    f"S1-Script-1 total time                : "
+    f"{s1_script1_time:.2f} seconds"
+)
+
+print(
+    f"HDFS output verified                  : "
+    f"{'PASS' if status == 'SUCCESS' else 'FAIL'}"
+)
+
 print(f"Average CPU utilization               : {average(cpu_samples):.2f}%")
 print(
-    "Peak CPU utilization                  : "
+    f"Peak CPU utilization                  : "
     f"{max(cpu_samples) if cpu_samples else 0.0:.2f}%"
 )
 print(
-    "Average memory utilization            : "
+    f"Average memory utilization            : "
     f"{average(memory_samples):.2f}%"
 )
 print(
-    "Peak memory utilization              : "
+    f"Peak memory utilization               : "
     f"{max(memory_samples) if memory_samples else 0.0:.2f}%"
 )
-print(f"Raw HDFS storage size                 : {raw_size_mb:.4f} MB")
-print(f"Hashed HDFS storage size              : {hashed_size_mb:.4f} MB")
+
+print(f"HDFS storage size                     : {storage_size:.4f} MB")
 print(f"Output records                        : {records}")
 print("Retry required                        : NO")
 print("Number of retries                     : 0")
 print(f"Error / failure message               : {error_message}")
 print(
-    "Abnormal condition observed           : "
+    f"Abnormal condition observed           : "
     f"{'NO' if status == 'SUCCESS' else 'YES'}"
 )
-print("S0 baseline pipeline                  : RETAINED")
-print("S1 hash-chain protection              : PASS")
+
+print("S0 baseline workflow                  : RETAINED")
+print("S1 hash-chain protection              : "
+      f"{'PASS' if status == 'SUCCESS' else 'FAIL'}")
+
 print("=" * 72)
 
 sys.exit(0 if status == "SUCCESS" else 1)
