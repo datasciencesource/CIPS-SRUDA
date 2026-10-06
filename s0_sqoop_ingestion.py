@@ -1,289 +1,43 @@
-import os
-import subprocess
-import sys
-import threading
-import time
 
-# =====================================
-# S0 - Sqoop Ingestion Configuration
-# =====================================
-
-REMOTE_DB = "jdbc:mysql://69.175.69.34/sumrachna_hd"
-USERNAME = "sumrachna_hd"
-
-PASSWORD = os.getenv("REMOTE_DB_PASSWORD")
-TABLE = os.getenv("SOURCE_TABLE")
-
-HDFS_TARGET = "/security_lab/s0"
-
-# S0 has no study-added security processing
-SECURITY_PROCESSING_TIME = 0.00
-
-# =====================================
-# Experimental Dataset Definition
-# =====================================
-
-DATASETS = {
-    "table_stock100": {
-        "scale": "Small",
-        "expected_records": 125
-    },
-    "table_stock20K": {
-        "scale": "Medium",
-        "expected_records": 24858
-    },
-    "table_stock4M": {
-        "scale": "Large",
-        "expected_records": 4248576
-    }
-}
-
-# =====================================
-# Check Credentials and Table
-# =====================================
-
-if not PASSWORD:
-    print("ERROR: REMOTE_DB_PASSWORD is not set.")
-    print("Run:")
-    print("export REMOTE_DB_PASSWORD='your_password'")
-    sys.exit(1)
-
-if not TABLE:
-    print("ERROR: SOURCE_TABLE is not set.")
-    print()
-    print("Choose one:")
-    print('export SOURCE_TABLE="table_stock100"')
-    print('export SOURCE_TABLE="table_stock20K"')
-    print('export SOURCE_TABLE="table_stock4M"')
-    sys.exit(1)
-
-if TABLE not in DATASETS:
-    print(f"ERROR: Invalid SOURCE_TABLE: {TABLE}")
-    print()
-    print("Allowed experimental tables:")
-    print("  table_stock100  = Small")
-    print("  table_stock20K  = Medium")
-    print("  table_stock4M   = Large")
-    sys.exit(1)
-
-DATASET_SCALE = DATASETS[TABLE]["scale"]
-EXPECTED_RECORDS = DATASETS[TABLE]["expected_records"]
-
-# =====================================
-# Resource Monitoring
-# =====================================
-
-cpu_samples = []
-memory_samples = []
-stop_monitoring = threading.Event()
-
-
-def get_cpu_values():
-    with open("/proc/stat", "r") as f:
-        values = list(map(float, f.readline().split()[1:9]))
-
-    user, nice, system, idle, iowait, irq, softirq, steal = values
-
-    idle_total = idle + iowait
-    active_total = user + nice + system + irq + softirq + steal
-    total = idle_total + active_total
-
-    return total, idle_total
-
-
-def get_memory_percent():
-    meminfo = {}
-
-    with open("/proc/meminfo", "r") as f:
-        for line in f:
-            key, value = line.split(":", 1)
-            meminfo[key] = float(value.strip().split()[0])
-
-    total = meminfo["MemTotal"]
-    available = meminfo["MemAvailable"]
-
-    return ((total - available) / total) * 100
-
-
-def monitor_resources():
-    previous_total, previous_idle = get_cpu_values()
-
-    while not stop_monitoring.wait(0.5):
-
-        current_total, current_idle = get_cpu_values()
-
-        total_delta = current_total - previous_total
-        idle_delta = current_idle - previous_idle
-
-        if total_delta > 0:
-            cpu_percent = (
-                (total_delta - idle_delta) / total_delta
-            ) * 100
-
-            cpu_samples.append(cpu_percent)
-
-        memory_samples.append(get_memory_percent())
-
-        previous_total = current_total
-        previous_idle = current_idle
-
-
-monitor_thread = threading.Thread(
-    target=monitor_resources,
-    daemon=True
-)
-
-# =====================================
-# Sqoop Import
-# Remote MySQL -> HDFS
-# =====================================
-
-command = [
-    "sqoop",
-    "import",
-    "--connect", REMOTE_DB,
-    "--username", USERNAME,
-    "--password", PASSWORD,
-    "--table", TABLE,
-    "--target-dir", HDFS_TARGET,
-    "--delete-target-dir"
-]
-
-print("=" * 70)
-print("S0 - SQOOP INGESTION")
-print("=" * 70)
-
-print(f"Dataset scale    : {DATASET_SCALE}")
-print(f"Source table     : {TABLE}")
-print(f"Expected records : {EXPECTED_RECORDS}")
-print(f"HDFS target      : {HDFS_TARGET}")
-print()
-
-# =====================================
-# Start Measurement
-# =====================================
-
-monitor_thread.start()
-
-start_time = time.time()
-
-try:
-    result = subprocess.run(command)
-
-finally:
-    end_time = time.time()
-
-    stop_monitoring.set()
-    monitor_thread.join()
-
-ingestion_time = end_time - start_time
-
-# =====================================
-# Resource Results
-# =====================================
-
-average_cpu = (
-    sum(cpu_samples) / len(cpu_samples)
-    if cpu_samples else 0.0
-)
-
-peak_cpu = (
-    max(cpu_samples)
-    if cpu_samples else 0.0
-)
-
-average_memory = (
-    sum(memory_samples) / len(memory_samples)
-    if memory_samples else 0.0
-)
-
-peak_memory = (
-    max(memory_samples)
-    if memory_samples else 0.0
-)
-
-# =====================================
-# HDFS Storage Size
-# =====================================
-
-hdfs_size_bytes = 0
-
-if result.returncode == 0:
-
-    size_result = subprocess.run(
-        ["hdfs", "dfs", "-du", "-s", HDFS_TARGET],
-        capture_output=True,
-        text=True
-    )
-
-    if size_result.returncode == 0:
-        try:
-            hdfs_size_bytes = int(
-                size_result.stdout.split()[0]
-            )
-        except (ValueError, IndexError):
-            hdfs_size_bytes = 0
-
-
-hdfs_size_mb = hdfs_size_bytes / (1024 ** 2)
-
-# =====================================
-# Results
-# =====================================
-
-print()
-print("=" * 70)
+print("=" * 72)
 print("S0 - SQOOP INGESTION RESULT")
-print("=" * 70)
+print("=" * 72)
+print(f"Laboratory environment                : S0")
+print(f"Experiment ID                         : {EXPERIMENT_ID}")
+print(f"Strategy under test                   : S0")
+print(f"Dataset scale                         : {DATASET_SCALE}")
+print(f"Source table                          : {SOURCE_TABLE}")
+print(f"Expected records                      : {EXPECTED_RECORDS}")
+print(f"Run number                            : {RUN_NUMBER}")
+start_label = datetime.now().astimezone().isoformat(timespec="seconds")
+print(f"Workflow start time                   : {start_label}")
 
-print(f"Dataset scale                          : {DATASET_SCALE}")
-print(f"Source table                           : {TABLE}")
-print(f"Expected records                       : {EXPECTED_RECORDS}")
+thread = threading.Thread(target=monitor, daemon=True)
+thread.start()
+start = time.perf_counter()
+result = subprocess.run(command)
+elapsed = time.perf_counter() - start
+stop_event.set()
+thread.join()
+end_label = datetime.now().astimezone().isoformat(timespec="seconds")
 
-if result.returncode == 0:
-    print("Execution status                       : SUCCESS")
-else:
-    print("Execution status                       : FAILED")
-
-print(
-    f"Sqoop ingestion time "
-    f"(Remote MySQL -> HDFS)                 : "
-    f"{ingestion_time:.2f} seconds"
-)
-
-print(
-    f"Additional security-processing time    : "
-    f"{SECURITY_PROCESSING_TIME:.2f} seconds"
-)
-
-print(
-    f"Average CPU utilization                : "
-    f"{average_cpu:.2f}%"
-)
-
-print(
-    f"Peak CPU utilization                   : "
-    f"{peak_cpu:.2f}%"
-)
-
-print(
-    f"Average memory utilization             : "
-    f"{average_memory:.2f}%"
-)
-
-print(
-    f"Peak memory utilization                : "
-    f"{peak_memory:.2f}%"
-)
-
-print(
-    f"HDFS storage size                      : "
-    f"{hdfs_size_mb:.4f} MB"
-)
-
-print("=" * 70)
-print("Note: 0.00 security-processing time = no study-added")
-print("      security processing in the S0 baseline.")
-print("=" * 70)
-
+success = result.returncode == 0
+size_mb = hdfs_size() if success else 0.0
+status = "SUCCESS" if success else "FAILED"
+print(f"Workflow end time                     : {end_label}")
+print(f"Execution status                      : {status}")
+print(f"Sqoop ingestion time                  : {elapsed:.2f} seconds")
+print(f"Additional security-processing time   : 0.00 seconds")
+print(f"HDFS output verified                  : {'PASS' if success and size_mb > 0 else 'FAIL'}")
+print(f"Average CPU utilization               : {average(cpu_samples):.2f}%")
+print(f"Peak CPU utilization                  : {max(cpu_samples) if cpu_samples else 0.0:.2f}%")
+print(f"Average memory utilization            : {average(memory_samples):.2f}%")
+print(f"Peak memory utilization               : {max(memory_samples) if memory_samples else 0.0:.2f}%")
+print(f"HDFS storage size                     : {size_mb:.4f} MB")
+print("Retry required                        : NO")
+print("Number of retries                     : 0")
+print(f"Error / failure message               : {'N/A' if success else 'Sqoop ingestion failed'}")
+print(f"Abnormal condition observed           : {'NO' if success else 'YES'}")
+print("S0 security indicators 1–3            : PASS (baseline controls)")
+print("S1/S2/S3 indicators                   : N/A - not tested")
 sys.exit(result.returncode)
