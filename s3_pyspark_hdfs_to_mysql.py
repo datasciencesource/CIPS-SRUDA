@@ -2582,15 +2582,19 @@ hdfs_size_mb = (
 )
 
 
-additional_security_processing_time = (
+s2_script2_processing_time = decrypt_verify_time
 
+s3_script2_control_time = (
     hdfs_check_time
-
     + mysql_connectivity_time
-
-    + decrypt_verify_time
-
     + audit_time_total
+)
+
+# S3 Script 2 = S2 Script 2 processing + S3 controls.
+# Count decryption and verification only once.
+additional_security_processing_time = (
+    s2_script2_processing_time
+    + s3_script2_control_time
 )
 
 
@@ -2845,17 +2849,24 @@ print(
 )
 
 print(
-    f"Decryption + hash verification time   : "
+    f"S2 Script 2 processing time           : "
+    f"(decryption + verification)           : "
     f"{decrypt_verify_time:.2f} seconds"
 )
 
 print(
-    f"Audit logging time                    : "
+    f"S3 audit logging time                 : "
     f"{audit_time_total:.4f} seconds"
 )
 
 print(
-    f"Additional security-processing time   : "
+    f"S3 Script 2 control time              : "
+    f"(availability + connectivity + audit) : "
+    f"{s3_script2_control_time:.4f} seconds"
+)
+
+print(
+    f"S3 Script 2 cumulative security time  : "
     f"{additional_security_processing_time:.2f} seconds"
 )
 
@@ -2870,7 +2881,7 @@ print(
 )
 
 print(
-    f"Script 2 total measured time          : "
+    f"S3 Script 2 total measured time       : "
     f"{script2_total_measured_time:.2f} seconds"
 )
 
@@ -2940,4 +2951,3 @@ print(
 
 sys.exit(
     final_returncode
-)
