@@ -38,12 +38,20 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 #   -> /security_lab/s3_build/part*
 #   -> move encrypted part files only
 #   -> /security_lab/s3/part*
-#   -> HDFS Data Availability Check
+#   -> S2 processing: SHA-256 hash-chain + AES-256-GCM encryption
+#   -> S3 control: HDFS Data Availability Check
+#   -> S3 control: Audit Logging
 #
 # ==========================================================
 
 
 STRATEGY = "S3"
+
+# This version is intentionally S3-only.
+ENABLE_INTEGRITY = True
+ENABLE_ENCRYPTION = True
+ENABLE_AVAILABILITY = True
+ENABLE_AUDIT = True
 
 
 # ==========================================================
@@ -67,20 +75,14 @@ SOURCE_TABLE = os.getenv(
 
 
 # ==========================================================
-# HDFS Paths - S3 ONLY
+# HDFS Paths - selected strategy
 # ==========================================================
 
-HDFS_STAGING = (
-    "/security_lab/s3_staging"
-)
+HDFS_STAGING = "/security_lab/s3_staging"
 
-HDFS_BUILD = (
-    "/security_lab/s3_build"
-)
+HDFS_BUILD = "/security_lab/s3_build"
 
-HDFS_TARGET = (
-    "/security_lab/s3"
-)
+HDFS_TARGET = "/security_lab/s3"
 
 
 # ==========================================================
@@ -95,9 +97,7 @@ ENCRYPTION_ALGORITHM = (
     "AES-256-GCM"
 )
 
-AES_KEY_B64 = os.getenv(
-    "S3_AES_KEY_B64"
-)
+AES_KEY_B64 = os.getenv("S3_AES_KEY_B64")
 
 
 # ==========================================================
@@ -113,7 +113,7 @@ AUDIT_LOG = os.getenv(
 RUN_ID = os.getenv(
     "S3_RUN_ID",
     (
-        f"S3-"
+        f"{STRATEGY}-"
         f"{SOURCE_TABLE or 'unknown'}-"
         f"{datetime.now().strftime('%Y%m%d-%H%M%S')}"
     )
@@ -220,7 +220,7 @@ if SOURCE_TABLE not in DATASETS:
     sys.exit(1)
 
 
-if not AES_KEY_B64:
+if ENABLE_ENCRYPTION and not AES_KEY_B64:
 
     print(
         "ERROR: S3_AES_KEY_B64 "
@@ -235,42 +235,43 @@ if not AES_KEY_B64:
     sys.exit(1)
 
 
-try:
+if ENABLE_ENCRYPTION:
+    try:
 
-    AES_KEY = base64.b64decode(
-        AES_KEY_B64,
-        validate=True
-    )
+        AES_KEY = base64.b64decode(
+            AES_KEY_B64,
+            validate=True
+        )
 
+    except Exception:
 
-except Exception:
+        print(
+            "ERROR: S3_AES_KEY_B64 "
+            "is not valid Base64."
+        )
 
-    print(
-        "ERROR: S3_AES_KEY_B64 "
-        "is not valid Base64."
-    )
-
-    sys.exit(1)
-
-
-if len(AES_KEY) != 32:
-
-    print(
-        "ERROR: AES-256 requires exactly "
-        "32 decoded key bytes."
-    )
-
-    print(
-        f"Decoded key length: "
-        f"{len(AES_KEY)} bytes"
-    )
-
-    sys.exit(1)
+        sys.exit(1)
 
 
-aesgcm = AESGCM(
-    AES_KEY
-)
+    if len(AES_KEY) != 32:
+
+        print(
+            "ERROR: AES-256 requires exactly "
+            "32 decoded key bytes."
+        )
+
+        print(
+            f"Decoded key length: "
+            f"{len(AES_KEY)} bytes"
+        )
+
+        sys.exit(1)
+
+
+    aesgcm = AESGCM(AES_KEY)
+else:
+    AES_KEY = b""
+    aesgcm = None
 
 
 DATASET_SCALE = (
@@ -340,6 +341,9 @@ def audit_event(
 ):
 
     global audit_time_total
+
+    if not ENABLE_AUDIT:
+        return
 
 
     start = (
@@ -1048,6 +1052,10 @@ def reset_s3_environment():
         HDFS_BUILD
     )
 
+    if STRATEGY != "S3":
+        hdfs_remove(HDFS_TARGET)
+        hdfs_mkdir(HDFS_TARGET)
+
 
     print(
         f"Manual target preserved   : "
@@ -1100,6 +1108,9 @@ def calculate_current_hash(
 def encrypt_protected_row(
     protected_row
 ):
+
+    if not ENABLE_ENCRYPTION:
+        return protected_row
 
     nonce = os.urandom(
         12
@@ -1238,28 +1249,21 @@ def generate_encrypted_dataset():
                     continue
 
 
-                # ==========================================
-                # Integrity Protection
-                # ==========================================
-
-                current_hash = (
-                    calculate_current_hash(
+                if ENABLE_INTEGRITY:
+                    current_hash = calculate_current_hash(
                         previous_hash,
                         row_data
                     )
-                )
 
+                    protected_row = (
+                        f"{row_data},"
+                        f"{previous_hash},"
+                        f"{current_hash}"
+                    )
+                else:
+                    current_hash = previous_hash
+                    protected_row = row_data
 
-                protected_row = (
-                    f"{row_data},"
-                    f"{previous_hash},"
-                    f"{current_hash}"
-                )
-
-
-                # ==========================================
-                # Confidentiality Protection
-                # ==========================================
 
                 encrypted_row = (
                     encrypt_protected_row(
@@ -1278,9 +1282,8 @@ def generate_encrypted_dataset():
                 )
 
 
-                previous_hash = (
-                    current_hash
-                )
+                if ENABLE_INTEGRITY:
+                    previous_hash = current_hash
 
 
                 protected_records += 1
@@ -1461,7 +1464,7 @@ print(
 
 
 print(
-    "S3 - PROTECTED SQOOP INGESTION"
+    f"{STRATEGY} - CUMULATIVE SQOOP INGESTION"
 )
 
 
@@ -1584,9 +1587,10 @@ print(
 
 try:
 
-    validate_manual_s3_target(
-        HDFS_TARGET
-    )
+    if STRATEGY == "S3":
+        validate_manual_s3_target(HDFS_TARGET)
+    else:
+        hdfs_mkdir(HDFS_TARGET)
 
 
     print(
@@ -1606,7 +1610,8 @@ try:
 
 
     print(
-        "Target creation        : MANUAL"
+        "Target creation        : "
+        + ("MANUAL" if STRATEGY == "S3" else "SCRIPT-MANAGED")
     )
 
 
@@ -1864,8 +1869,8 @@ try:
 
 
     print(
-        "STAGE 2 - SHA-256 HASH CHAIN "
-        "+ AES-256-GCM ENCRYPTION"
+        "STAGE 2 - CUMULATIVE INTEGRITY "
+        "+ CONFIDENTIALITY PROCESSING"
     )
 
 
@@ -1918,24 +1923,23 @@ try:
     )
 
 
-    check_start = (
-        time.perf_counter()
-    )
+    if ENABLE_AVAILABILITY:
+        check_start = time.perf_counter()
 
+        (
+            available,
+            reason,
+            part_count
+        ) = check_hdfs_availability(HDFS_TARGET)
 
-    (
-        available,
-        reason,
-        part_count
-    ) = check_hdfs_availability(
-        HDFS_TARGET
-    )
-
-
-    hdfs_availability_time = (
-        time.perf_counter()
-        - check_start
-    )
+        hdfs_availability_time = (
+            time.perf_counter() - check_start
+        )
+    else:
+        available = True
+        reason = "Not applicable for " + STRATEGY
+        part_count = 0
+        hdfs_availability_time = 0.0
 
 
     hdfs_availability_reason = (
@@ -1948,7 +1952,7 @@ try:
     )
 
 
-    if not available:
+    if ENABLE_AVAILABILITY and not available:
 
         hdfs_availability_status = (
             "FAIL"
@@ -1991,7 +1995,8 @@ try:
 
 
     print(
-        "HDFS availability     : PASS"
+        "HDFS availability     : "
+        + ("PASS" if ENABLE_AVAILABILITY else "NOT RUN")
     )
 
 
@@ -2008,7 +2013,8 @@ try:
 
 
     print(
-        "Pipeline decision     : CONTINUE"
+        "Pipeline decision     : "
+        + ("CONTINUE" if ENABLE_AVAILABILITY else "NOT APPLICABLE")
     )
 
 
@@ -2024,9 +2030,7 @@ try:
     )
 
 
-    security_status = (
-        "SUCCESS"
-    )
+    security_status = "SUCCESS"
 
 
 # ==========================================================
@@ -2227,13 +2231,27 @@ hdfs_size_mb = (
 # Performance Measurements
 # ==========================================================
 
+"""Cumulative S3 Script 1 timing:
+
+S3 Script 1 = S2 Script 1 + S3 HDFS availability check + S3 audit logging.
+
+The S2 component already includes the S1 hash-chain operation. It must not be
+added again as a separate value.
+"""
+
+s3_script1_control_time = (
+
+    hdfs_availability_time
+
+    + audit_time_total
+)
+
+
 additional_security_processing_time = (
 
     hash_encrypt_time
 
-    + hdfs_availability_time
-
-    + audit_time_total
+    + s3_script1_control_time
 )
 
 
@@ -2258,8 +2276,10 @@ if (
     and protected_records
     == EXPECTED_RECORDS
 
-    and hdfs_availability_status
-    == "PASS"
+    and (
+        not ENABLE_AVAILABILITY
+        or hdfs_availability_status == "PASS"
+    )
 ):
 
     execution_status = (
@@ -2291,8 +2311,7 @@ print(
 
 
 print(
-    "S3 - SQOOP + PROTECTION "
-    "+ HDFS AVAILABILITY RESULT"
+    f"{STRATEGY} SCRIPT 1 - CUMULATIVE RESULT"
 )
 
 
@@ -2345,7 +2364,7 @@ print(
 
 print(
     f"HDFS availability                     : "
-    f"{hdfs_availability_status}"
+    f"{hdfs_availability_status if ENABLE_AVAILABILITY else 'NOT APPLICABLE'}"
 )
 
 
@@ -2375,31 +2394,38 @@ print(
 
 
 print(
-    f"Hash-chain + encryption time          : "
+    f"{STRATEGY} integrity/confidentiality time: "
     f"{hash_encrypt_time:.2f} seconds"
 )
 
 
 print(
-    f"HDFS availability-check time          : "
+    f"{STRATEGY} HDFS availability-check time : "
     f"{hdfs_availability_time:.4f} seconds"
 )
 
 
 print(
-    f"Audit logging time                    : "
+    f"{STRATEGY} audit logging time            : "
     f"{audit_time_total:.4f} seconds"
 )
 
 
 print(
-    f"Additional security-processing time   : "
+    f"{STRATEGY} control time                 : "
+    f"(availability + audit logging)        : "
+    f"{s3_script1_control_time:.4f} seconds"
+)
+
+
+print(
+    f"{STRATEGY} cumulative security time      : "
     f"{additional_security_processing_time:.2f} seconds"
 )
 
 
 print(
-    f"Script 1 total measured time          : "
+    f"{STRATEGY} Script 1 total measured time : "
     f"{script1_total_measured_time:.2f} seconds"
 )
 
