@@ -1151,6 +1151,8 @@ def decrypt_and_verify_dataset():
     violation_records = 0
 
     first_violations = []
+    decryption_operation_time = 0.0
+    verification_operation_time = 0.0
 
 
     for input_part in (
@@ -1231,11 +1233,9 @@ def decrypt_and_verify_dataset():
                 encrypted_records += 1
 
 
-                protected_row = (
-                    decrypt_encrypted_row(
-                        encrypted_line
-                    )
-                )
+                decrypt_start = time.perf_counter()
+                protected_row = decrypt_encrypted_row(encrypted_line)
+                decryption_operation_time += time.perf_counter() - decrypt_start
 
 
                 decrypted_records += 1
@@ -1291,6 +1291,7 @@ def decrypt_and_verify_dataset():
                 )
 
 
+                verification_start = time.perf_counter()
                 calculated_current_hash = (
                     calculate_current_hash(
 
@@ -1306,6 +1307,10 @@ def decrypt_and_verify_dataset():
                     calculated_current_hash
 
                     == stored_current_hash
+                )
+
+                verification_operation_time += (
+                    time.perf_counter() - verification_start
                 )
 
 
@@ -1491,7 +1496,13 @@ def decrypt_and_verify_dataset():
             expected_previous_hash,
 
         "details":
-            first_violations
+            first_violations,
+
+        "decryption_operation_time":
+            decryption_operation_time,
+
+        "verification_operation_time":
+            verification_operation_time
     }
 
 
@@ -2584,6 +2595,26 @@ hdfs_size_mb = (
 
 s2_script2_processing_time = decrypt_verify_time
 
+decryption_operation_time = verification.get(
+    "decryption_operation_time",
+    0.0
+)
+verification_operation_time = verification.get(
+    "verification_operation_time",
+    0.0
+)
+
+# Cumulative indicators recorded during this S3 run.
+s0_script2_time = pyspark_processing_time + mysql_write_time
+s1_script2_time = s0_script2_time + verification_operation_time
+s2_script2_time = s1_script2_time + decryption_operation_time
+s3_script2_time = (
+    s2_script2_time
+    + hdfs_check_time
+    + mysql_connectivity_time
+    + audit_time_total
+)
+
 s3_script2_control_time = (
     hdfs_check_time
     + mysql_connectivity_time
@@ -2883,6 +2914,20 @@ print(
 print(
     f"S3 Script 2 total measured time       : "
     f"{script2_total_measured_time:.2f} seconds"
+)
+
+print()
+print("CUMULATIVE INDICATORS RECORDED FROM THIS S3 RUN")
+print(f"S0 Script 2 cumulative time          : {s0_script2_time:.2f} seconds")
+print(f"S1 Script 2 cumulative time          : {s1_script2_time:.2f} seconds")
+print(f"S2 Script 2 cumulative time          : {s2_script2_time:.2f} seconds")
+print(f"S3 Script 2 cumulative time          : {s3_script2_time:.2f} seconds")
+
+print(
+    "S3 timing formula                     : "
+    "S2 processing + HDFS availability + "
+    "Local DB connectivity + audit logging "
+    "+ PySpark + Local MySQL write"
 )
 
 
