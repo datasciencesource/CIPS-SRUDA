@@ -1,3 +1,4 @@
+import base64
 import hashlib
 import os
 import subprocess
@@ -7,11 +8,14 @@ import threading
 import time
 from datetime import datetime
 
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+
 REMOTE_DB = "jdbc:mysql://69.175.69.34/sumrachna_hd"
 USERNAME = "sumrachna_hd"
 PASSWORD = os.getenv("REMOTE_DB_PASSWORD")
 SOURCE_TABLE = os.getenv("SOURCE_TABLE")
-ENCRYPTION_KEY = os.getenv("S2_ENCRYPTION_KEY")
+S2_AES_KEY_B64 = os.getenv("S2_AES_KEY_B64")
 
 RAW_HDFS_TARGET = "/security_lab/s2_raw"
 HDFS_TARGET = "/security_lab/s2"
@@ -26,8 +30,16 @@ if not PASSWORD or not SOURCE_TABLE or SOURCE_TABLE not in DATASETS:
     print("ERROR: Set REMOTE_DB_PASSWORD and a valid SOURCE_TABLE.")
     sys.exit(1)
 
-if not ENCRYPTION_KEY:
-    print("ERROR: Set S2_ENCRYPTION_KEY.")
+if not S2_AES_KEY_B64:
+    print("ERROR: Set S2_AES_KEY_B64.")
+    sys.exit(1)
+
+try:
+    AES_KEY = base64.b64decode(S2_AES_KEY_B64, validate=True)
+    if len(AES_KEY) != 32:
+        raise ValueError
+except Exception:
+    print("ERROR: S2_AES_KEY_B64 must decode to 32 bytes.")
     sys.exit(1)
 
 DATASET_SCALE, EXPECTED_RECORDS = DATASETS[SOURCE_TABLE]
@@ -95,13 +107,11 @@ def create_hash_chain():
     previous_hash = "GENESIS"
     records = 0
 
-    output = tempfile.NamedTemporaryFile(
+    hash_file = tempfile.NamedTemporaryFile(
         mode="w",
         delete=False,
         suffix=".csv"
     )
-
-    temporary_file = output.name
 
     raw_process = subprocess.Popen(
         [
@@ -116,7 +126,7 @@ def create_hash_chain():
     )
 
     for line in raw_process.stdout:
-        row = line.rstrip("\n\r")
+        row = line.rstrip("\r\n")
 
         if not row:
             continue
@@ -125,117 +135,49 @@ def create_hash_chain():
             f"{previous_hash}|{row}".encode("utf-8")
         ).hexdigest()
 
-        output.write(f"{row},{current_hash}\n")
+        hash_file.write(f"{row},{current_hash}\n")
         previous_hash = current_hash
         records += 1
 
-    output.close()
+    hash_file.close()
 
-    raw_error = raw_process.stderr.read()
-    raw_code = raw_process.wait()
+    error = raw_process.stderr.read()
+    return_code = raw_process.wait()
 
-    if raw_code != 0:
-        os.unlink(temporary_file)
-        raise RuntimeError(raw_error)
+    if return_code != 0:
+        os.unlink(hash_file.name)
+        raise RuntimeError(error)
 
     if records != EXPECTED_RECORDS:
-        os.unlink(temporary_file)
+        os.unlink(hash_file.name)
         raise RuntimeError(
             f"Expected {EXPECTED_RECORDS} records but found {records}"
         )
 
-    return temporary_file, records
+    return hash_file.name, records
 
 
-def encrypt_file(input_file):
+def encrypt_and_upload(hash_file):
     encrypted_file = tempfile.NamedTemporaryFile(
         delete=False,
         suffix=".enc"
-    ).name
-
-    environment = os.environ.copy()
-    environment["S2_KEY"] = ENCRYPTION_KEY
-
-    subprocess.run(
-        [
-            "openssl",
-            "enc",
-            "-aes-256-cbc",
-            "-pbkdf2",
-            "-salt",
-            "-in",
-            input_file,
-            "-out",
-            encrypted_file,
-            "-pass",
-            "env:S2_KEY"
-        ],
-        env=environment,
-        check=True
     )
 
-    return encrypted_file
+    encrypted_file.close()
 
+    with open(hash_file, "rb") as source:
+        plaintext = source.read()
 
-print("=" * 72)
-print("S2 - SQOOP, HASH-CHAIN, AND ENCRYPTION RESULT")
-print("=" * 72)
-print("Laboratory environment                : S2")
-print("Strategy under test                   : S2")
-print(f"Dataset scale                         : {DATASET_SCALE}")
-print(f"Source table                          : {SOURCE_TABLE}")
-print(f"Expected records                      : {EXPECTED_RECORDS}")
+    nonce = os.urandom(12)
+    ciphertext = AESGCM(AES_KEY).encrypt(
+        nonce,
+        plaintext,
+        None
+    )
 
-start_label = datetime.now().astimezone().isoformat(
-    timespec="seconds"
-)
-
-print(f"Workflow start time                   : {start_label}")
-
-monitor_thread = threading.Thread(
-    target=monitor,
-    daemon=True
-)
-monitor_thread.start()
-
-sqoop_command = [
-    "sqoop",
-    "import",
-    "--connect",
-    REMOTE_DB,
-    "--username",
-    USERNAME,
-    "--password",
-    PASSWORD,
-    "--table",
-    SOURCE_TABLE,
-    "--target-dir",
-    RAW_HDFS_TARGET,
-    "--delete-target-dir"
-]
-
-status = "FAILED"
-error_message = "N/A"
-sqoop_time = 0.0
-hash_time = 0.0
-encryption_time = 0.0
-records = 0
-
-try:
-    sqoop_start = time.perf_counter()
-    sqoop_result = subprocess.run(sqoop_command)
-    sqoop_time = time.perf_counter() - sqoop_start
-
-    if sqoop_result.returncode != 0:
-        raise RuntimeError("Sqoop ingestion failed.")
-
-    hash_start = time.perf_counter()
-    hash_file, records = create_hash_chain()
-    hash_time = time.perf_counter() - hash_start
-
-    encryption_start = time.perf_counter()
-    encrypted_file = encrypt_file(hash_file)
-    encryption_time = time.perf_counter() - encryption_start
+    with open(encrypted_file.name, "wb") as target:
+        target.write(nonce)
+        target.write(ciphertext)
 
     subprocess.run(
         ["hdfs", "dfs", "-rm", "-r", "-f", HDFS_TARGET],
@@ -253,41 +195,110 @@ try:
             "dfs",
             "-put",
             "-f",
-            encrypted_file,
+            encrypted_file.name,
             f"{HDFS_TARGET}/part-00000.enc"
         ],
         check=True
     )
 
-    os.unlink(hash_file)
-    os.unlink(encrypted_file)
+    os.unlink(encrypted_file.name)
+
+
+start_label = datetime.now().astimezone().isoformat(
+    timespec="seconds"
+)
+
+monitor_thread = threading.Thread(
+    target=monitor,
+    daemon=True
+)
+monitor_thread.start()
+
+status = "FAILED"
+error_message = "N/A"
+
+sqoop_time = 0.0
+hash_time = 0.0
+encryption_time = 0.0
+records = 0
+hash_file = None
+
+try:
+    sqoop_command = [
+        "sqoop",
+        "import",
+        "--connect",
+        REMOTE_DB,
+        "--username",
+        USERNAME,
+        "--password",
+        PASSWORD,
+        "--table",
+        SOURCE_TABLE,
+        "--target-dir",
+        RAW_HDFS_TARGET,
+        "--delete-target-dir"
+    ]
+
+    sqoop_start = time.perf_counter()
+    result = subprocess.run(sqoop_command)
+    sqoop_time = time.perf_counter() - sqoop_start
+
+    if result.returncode != 0:
+        raise RuntimeError("Sqoop ingestion failed.")
+
+    hash_start = time.perf_counter()
+    hash_file, records = create_hash_chain()
+    hash_time = time.perf_counter() - hash_start
+
+    encryption_start = time.perf_counter()
+    encrypt_and_upload(hash_file)
+    encryption_time = time.perf_counter() - encryption_start
 
     status = "SUCCESS"
 
 except Exception as exc:
     error_message = str(exc)
 
-stop_event.set()
-monitor_thread.join()
+finally:
+    if hash_file and os.path.exists(hash_file):
+        os.unlink(hash_file)
+
+    stop_event.set()
+    monitor_thread.join()
+
 
 end_label = datetime.now().astimezone().isoformat(
     timespec="seconds"
 )
 
 s0_script1_time = sqoop_time
-s1_script1_time = sqoop_time + hash_time
+s1_script1_time = s0_script1_time + hash_time
 s2_script1_time = s1_script1_time + encryption_time
-storage_size = hdfs_size(HDFS_TARGET)
 
+storage_size = (
+    hdfs_size(HDFS_TARGET)
+    if status == "SUCCESS"
+    else 0.0
+)
+
+print("=" * 72)
+print("S2 - SQOOP, HASH-CHAIN, AND AES-GCM RESULT")
+print("=" * 72)
+print("Laboratory environment                : S2")
+print("Strategy under test                   : S2")
+print(f"Dataset scale                         : {DATASET_SCALE}")
+print(f"Source table                          : {SOURCE_TABLE}")
+print(f"Workflow start time                   : {start_label}")
 print(f"Workflow end time                     : {end_label}")
 print(f"Execution status                      : {status}")
 print(f"S0-Script-1 time                      : {s0_script1_time:.2f} seconds")
 print(f"Hash-chain time                       : {hash_time:.2f} seconds")
 print(f"S1-Script-1 total time                : {s1_script1_time:.2f} seconds")
-print(f"Encryption time                       : {encryption_time:.2f} seconds")
+print(f"AES-GCM encryption time               : {encryption_time:.2f} seconds")
 print(f"S2-Script-1 total time                : {s2_script1_time:.2f} seconds")
 print(
-    f"HDFS output verified                  : "
+    "HDFS output verified                  : "
     f"{'PASS' if status == 'SUCCESS' else 'FAIL'}"
 )
 print(f"HDFS storage size                     : {storage_size:.4f} MB")
@@ -297,10 +308,7 @@ print(
     f"Peak CPU utilization                  : "
     f"{max(cpu_samples) if cpu_samples else 0.0:.2f}%"
 )
-print(
-    f"Average memory utilization            : "
-    f"{average(memory_samples):.2f}%"
-)
+print(f"Average memory utilization            : {average(memory_samples):.2f}%")
 print(
     f"Peak memory utilization               : "
     f"{max(memory_samples) if memory_samples else 0.0:.2f}%"
@@ -318,7 +326,7 @@ print(
     f"{'PASS' if status == 'SUCCESS' else 'FAIL'}"
 )
 print(
-    "S2 encryption protection              : "
+    "S2 AES-GCM protection                 : "
     f"{'PASS' if status == 'SUCCESS' else 'FAIL'}"
 )
 print("=" * 72)
