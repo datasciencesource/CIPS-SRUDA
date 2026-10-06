@@ -1172,6 +1172,8 @@ def generate_encrypted_dataset():
 
 
     protected_records = 0
+    hash_chain_time = 0.0
+    encryption_time = 0.0
 
 
     # ------------------------------------------------------
@@ -1250,10 +1252,12 @@ def generate_encrypted_dataset():
 
 
                 if ENABLE_INTEGRITY:
+                    hash_start = time.perf_counter()
                     current_hash = calculate_current_hash(
                         previous_hash,
                         row_data
                     )
+                    hash_chain_time += time.perf_counter() - hash_start
 
                     protected_row = (
                         f"{row_data},"
@@ -1265,11 +1269,13 @@ def generate_encrypted_dataset():
                     protected_row = row_data
 
 
+                encryption_start = time.perf_counter()
                 encrypted_row = (
                     encrypt_protected_row(
                         protected_row
                     )
                 )
+                encryption_time += time.perf_counter() - encryption_start
 
 
                 # ==========================================
@@ -1422,7 +1428,9 @@ def generate_encrypted_dataset():
     return (
         protected_records,
         previous_hash,
-        security_processing_time
+        security_processing_time,
+        hash_chain_time,
+        encryption_time
     )
 
 
@@ -1741,6 +1749,10 @@ final_chain_hash = (
 
 hash_encrypt_time = 0.0
 
+hash_chain_time = 0.0
+
+encryption_time = 0.0
+
 hdfs_availability_time = 0.0
 
 hdfs_availability_status = (
@@ -1882,7 +1894,9 @@ try:
     (
         protected_records,
         final_chain_hash,
-        hash_encrypt_time
+        hash_encrypt_time,
+        hash_chain_time,
+        encryption_time
     ) = generate_encrypted_dataset()
 
 
@@ -2246,6 +2260,23 @@ s3_script1_control_time = (
     + audit_time_total
 )
 
+# Cumulative indicators recorded during one S3 run.
+# S0 = ingestion; S1 = S0 + hash chain; S2 = S1 + encryption;
+# S3 = S2 + HDFS availability + audit logging.
+s0_script1_time = sqoop_ingestion_time
+s1_script1_time = (
+    s0_script1_time
+    + hash_chain_time
+)
+s2_script1_time = (
+    s1_script1_time
+    + encryption_time
+)
+s3_script1_time = (
+    s2_script1_time
+    + s3_script1_control_time
+)
+
 
 additional_security_processing_time = (
 
@@ -2427,6 +2458,25 @@ print(
 print(
     f"{STRATEGY} Script 1 total measured time : "
     f"{script1_total_measured_time:.2f} seconds"
+)
+
+print()
+print("CUMULATIVE INDICATORS RECORDED FROM THIS S3 RUN")
+print(
+    f"S0 Script 1 cumulative time          : "
+    f"{s0_script1_time:.2f} seconds"
+)
+print(
+    f"S1 Script 1 cumulative time          : "
+    f"{s1_script1_time:.2f} seconds"
+)
+print(
+    f"S2 Script 1 cumulative time          : "
+    f"{s2_script1_time:.2f} seconds"
+)
+print(
+    f"S3 Script 1 cumulative time          : "
+    f"{s3_script1_time:.2f} seconds"
 )
 
 
