@@ -94,3 +94,98 @@ def hash_chain_dataset():
         writer = subprocess.Popen(
             ["hdfs", "dfs", "-put", "-", output_file],
             stdin=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        try:
+            for raw in reader.stdout:
+                row = raw.rstrip("\r\n")
+                if not row:
+                    continue
+                current_hash = calculate_hash(previous_hash, row)
+                writer.stdin.write(f"{row},{previous_hash},{current_hash}\n")
+                previous_hash = current_hash
+                records += 1
+        finally:
+            reader.stdout.close()
+            writer.stdin.close()
+        reader_error = reader.stderr.read()
+        writer_error = writer.stderr.read()
+        if reader.wait() != 0:
+            raise RuntimeError(reader_error)
+        if writer.wait() != 0:
+            raise RuntimeError(writer_error)
+
+    if records != EXPECTED_RECORDS:
+        raise RuntimeError(f"Expected {EXPECTED_RECORDS} records but hashed {records}")
+    return records, previous_hash, time.perf_counter() - start
+
+
+command = [
+    "sqoop", "import", "--connect", REMOTE_DB,
+    "--username", USERNAME, "--password", PASSWORD,
+    "--table", SOURCE_TABLE, "--target-dir", HDFS_STAGING,
+    "--delete-target-dir",
+]
+
+start_label = datetime.now().astimezone().isoformat(timespec="seconds")
+thread = threading.Thread(target=monitor, daemon=True)
+thread.start()
+ingestion_start = time.perf_counter()
+sqoop = subprocess.run(command)
+s0_time = time.perf_counter() - ingestion_start
+stop_event.set()
+thread.join()
+
+status = "SUCCESS"
+error = "N/A"
+protected_records = 0
+final_hash = "N/A"
+s1_hash_time = 0.0
+try:
+    if sqoop.returncode != 0:
+        raise RuntimeError("Sqoop ingestion failed")
+    protected_records, final_hash, s1_hash_time = hash_chain_dataset()
+except Exception as exc:
+    status = "FAILED"
+    error = str(exc)
+
+end_label = datetime.now().astimezone().isoformat(timespec="seconds")
+s1_total = s0_time + s1_hash_time
+size_result = run_hdfs(["-du", "-s", HDFS_TARGET], capture=True) if status == "SUCCESS" else None
+try:
+    storage_mb = int(size_result.stdout.split()[0]) / (1024 ** 2)
+except (AttributeError, ValueError, IndexError):
+    storage_mb = 0.0
+
+print("=" * 72)
+print("S1 - SQOOP INGESTION + HASH-CHAIN RESULT")
+print("=" * 72)
+print("Laboratory environment                : S1")
+print("Strategy under test                   : S1")
+print(f"Dataset scale                         : {DATASET_SCALE}")
+print(f"Source table                          : {SOURCE_TABLE}")
+print(f"Expected records                      : {EXPECTED_RECORDS}")
+print(f"Workflow start time                   : {start_label}")
+print(f"Workflow end time                     : {end_label}")
+print(f"Execution status                      : {status}")
+print(f"S0-Script-1 ingestion time            : {s0_time:.2f} seconds")
+print(f"S1 hash-chain processing time         : {s1_hash_time:.2f} seconds")
+print(f"S1-Script-1 cumulative time           : {s1_total:.2f} seconds")
+print(f"Protected records                     : {protected_records}")
+print(f"HDFS output verified                  : {'PASS' if status == 'SUCCESS' else 'FAIL'}")
+print(f"Average CPU utilization               : {average(cpu_samples):.2f}%")
+print(f"Peak CPU utilization                  : {max(cpu_samples) if cpu_samples else 0.0:.2f}%")
+print(f"Average memory utilization            : {average(memory_samples):.2f}%")
+print(f"Peak memory utilization               : {max(memory_samples) if memory_samples else 0.0:.2f}%")
+print(f"HDFS storage size                     : {storage_mb:.4f} MB")
+print("Retry required                        : NO")
+print("Number of retries                     : 0")
+print(f"Error / failure message               : {error}")
+print(f"Abnormal condition observed           : {'NO' if status == 'SUCCESS' else 'YES'}")
+print("S0 indicators                        : RECORDED")
+print("S1 indicators                        : RECORDED")
+print("S2/S3 indicators                     : N/A - not tested")
+print(f"Hash algorithm                        : SHA-256")
+print(f"Genesis previous hash                 : {GENESIS_HASH}")
+print(f"Final chain hash                      : {final_hash}")
+print("=" * 72)
+sys.exit(0 if status == "SUCCESS" else 1)
