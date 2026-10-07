@@ -7,6 +7,9 @@ Append mode is retained: the script never clears the destination table.
 A failed JDBC write may leave partial output; no automatic retry is made.
 Decryption time includes HDFS download. Spark startup/cleanup and summary
 saving are outside cumulative component totals and reported separately.
+S2 processing order is retained: decrypt, parse/count, verify, write.
+S3 adds the connectivity gate before writing and timed audit events.
+Resource monitoring excludes Spark startup and shutdown, as in S2.
 """
 import base64
 import hashlib
@@ -23,8 +26,7 @@ from pathlib import Path
 
 HDFS_INPUT = "hdfs:///security_lab/s3/part-00000.enc"
 MYSQL_URL = ("jdbc:mysql://127.0.0.1:3306/dbtest"
-             "?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC"
-             "&connectTimeout=10000&socketTimeout=30000")
+             "?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC")
 MYSQL_TABLE = "table_stock"
 MYSQL_USER = "usertest"
 DATASETS = {
@@ -59,7 +61,6 @@ class Monitor:
     def run(self):
         try:
             old_total, old_idle = cpu_values()
-            self.memory.append(memory_percent())
             while not self.stop.wait(0.5):
                 total, idle = cpu_values()
                 if total > old_total:
@@ -121,7 +122,9 @@ def check_mysql_connectivity(spark, password):
         properties.setProperty("user", MYSQL_USER)
         properties.setProperty("password", password)
         driver = spark._jvm.com.mysql.cj.jdbc.Driver()
-        connection = driver.connect(MYSQL_URL, properties)
+        # Bound only the added S3 check; retain S2's URL for the data write.
+        connection = driver.connect(
+            MYSQL_URL + "&connectTimeout=10000&socketTimeout=30000", properties)
         if connection is None:
             raise RuntimeError("JDBC driver could not open the local MySQL connection.")
         statement = connection.createStatement()
@@ -166,6 +169,76 @@ def write_mysql(data, password):
      .mode("append").save())
 
 
+
+def print_instrument_tables(metrics, save_error):
+    """Print Instrument 1 sections last, after the detailed JSON."""
+    script = metrics["script"]
+    number = 1 if script == "sqoop" else 2
+    def formatted(value, digits=6):
+        return "N/A" if value is None else f"{value:.{digits}f}"
+    def table(headers, rows):
+        print("| " + " | ".join(headers) + " |")
+        print("| " + " | ".join("---" for _ in headers) + " |")
+        for row in rows:
+            print("| " + " | ".join(str(v).replace("|", "/").replace("\n", " ") for v in row) + " |")
+    print("\nB. Performance Measurement")
+    print(f"Current strategy: S3 | Script-{number}: {script} | Dataset: {metrics['dataset']}")
+    rows = []
+    for strategy in range(4):
+        for part in (1, 2):
+            label = f"S{strategy}-Script-{part}"
+            value = metrics["cumulative_seconds"].get(label)
+            rows.append((label, f"S{strategy}", "seconds",
+                         formatted(value) if part == number else "N/A - other script"))
+    rate = metrics.get("throughput_records_per_second")
+    rows.extend([
+        ("Local MySQL write time", "Current", "seconds",
+         formatted(metrics["component_seconds"].get("mysql_write"))),
+        ("Total pipeline time", "Current", "seconds", "N/A - whole pipeline not measured"),
+        ("Throughput", "Current", "records/second", formatted(rate) + " (this script only)" if rate is not None else "N/A"),
+        ("HDFS storage size", "Current", "MB", formatted(metrics.get("hdfs_storage_mb"))),
+        ("Output records", "Current", "records", metrics["output_records"] if metrics["output_records"] is not None else "N/A"),
+        ("Average CPU utilization", "Current", "%", formatted(metrics["cpu_average_percent"], 2)),
+        ("Peak CPU utilization", "Current", "%", formatted(metrics["cpu_peak_percent"], 2)),
+        ("Average memory utilization", "Current", "%", formatted(metrics["memory_average_percent"], 2)),
+        ("Peak memory utilization", "Current", "%", formatted(metrics["memory_peak_percent"], 2)),
+    ])
+    table(["Metric", "Strategy", "Unit", "Recorded Value"], rows)
+    print("CPU/memory cover this script's monitoring window on the whole VM.")
+    print("S0-S2 values are cumulative components of this S3 run.")
+    print("S2-Script-2 = S1-Script-2 + decryption (verification counted once).")
+    print("\nC. Execution Reliability")
+    success = metrics["status"] == "SUCCESS" and not save_error
+    issues = []
+    if metrics["error"] != "N/A":
+        issues.append(metrics["error"])
+    if save_error:
+        issues.append("Measurement save failed: " + save_error)
+    abnormal = not success or bool(metrics.get("monitoring_error")) or bool(metrics.get("cleanup_errors"))
+    if success and script == "sqoop":
+        notes = (f"S3 ingestion completed; {metrics['output_records']} records hash-chained and encrypted; "
+                 "HDFS availability checked and audit events recorded.")
+    elif success:
+        notes = (f"S3 processing completed; {metrics['verified_records']} records verified; "
+                 f"JDBC write completed for {metrics['output_records']} records; "
+                 "local DB connectivity checked and audit events recorded.")
+    else:
+        notes = "S3 workflow did not complete successfully. Inspect stage statuses before retrying."
+    if script == "pyspark":
+        notes += " MySQL write state: " + metrics["mysql_write_state"] + "."
+    if metrics.get("monitoring_error"):
+        notes += " Monitoring error: " + metrics["monitoring_error"]
+    if metrics.get("cleanup_errors"):
+        notes += " Cleanup errors: " + "; ".join(metrics["cleanup_errors"])
+    table(["Field", "Entry", "Recorded Value"], [
+        ("Execution status", "Success / Failure", "Success" if success else "Failure"),
+        ("Retry required", "Yes / No", "No" if success else "Review failure before retrying"),
+        ("Number of retries", "count", metrics["retries"]),
+        ("Error / failure message", "text", "; ".join(issues) or "N/A"),
+        ("Abnormal condition observed", "Yes / No", "Yes" if abnormal else "No"),
+        ("Notes", "Text", notes),
+    ])
+
 def main():
     os.umask(0o077)
     source_table = os.getenv("SOURCE_TABLE", "")
@@ -189,6 +262,7 @@ def main():
     start_label = now()
     workflow_start = time.perf_counter()
     monitor = Monitor()
+    monitor_started = False
 
     def redact(message):
         text = str(message)
@@ -233,7 +307,6 @@ def main():
         return value
 
 
-    monitor.thread.start()
     try:
         audit("WORKFLOW_STARTED", "INFO")
         if not password or source_table not in DATASETS:
@@ -253,10 +326,12 @@ def main():
             spark.sparkContext.setLogLevel("ERROR")
         finally:
             spark_startup_time = time.perf_counter() - started
+        monitor.thread.start()
+        monitor_started = True
         with tempfile.TemporaryDirectory(prefix="s3_pyspark_") as temporary:
             decrypted_file = stage("decryption", lambda: decrypt_hdfs_file(Path(temporary), key))
-            verified_records = stage("hash_verification", lambda: verify_hash_chain(decrypted_file, expected))
             data, records = stage("pyspark_processing", lambda: process_data(spark, decrypted_file, expected))
+            verified_records = stage("hash_verification", lambda: verify_hash_chain(decrypted_file, expected))
             # Gate the write immediately before it starts.
             stage("mysql_connectivity", lambda: check_mysql_connectivity(spark, password))
 
@@ -278,6 +353,9 @@ def main():
         except Exception as audit_exc:
             error += "; " + str(audit_exc)
     finally:
+        monitor.stop.set()
+        if monitor_started:
+            monitor.thread.join()
         started = time.perf_counter()
         for cleanup in ([data.unpersist] if data is not None else []) + ([spark.stop] if spark is not None else []):
             try:
@@ -285,8 +363,6 @@ def main():
             except Exception as exc:
                 cleanup_errors.append(redact(exc))
         spark_cleanup_time = time.perf_counter() - started
-        monitor.stop.set()
-        monitor.thread.join()
 
     end_label = now()
     wall_time = time.perf_counter() - workflow_start
@@ -315,6 +391,9 @@ def main():
         cpu_average_percent=mean(monitor.cpu), cpu_peak_percent=max(monitor.cpu, default=None),
         memory_average_percent=mean(monitor.memory), memory_peak_percent=max(monitor.memory, default=None),
         resource_scope="whole host/VM", monitoring_error=monitor.error,
+        monitoring_window="after Spark startup through workflow completion, before Spark cleanup",
+        cpu_sample_count=len(monitor.cpu), memory_sample_count=len(monitor.memory),
+        cpu_sample_sum=sum(monitor.cpu), memory_sample_sum=sum(monitor.memory),
         retries=0, pipeline_total_seconds=None,
         timing_note="Decryption includes HDFS download. Verification is added once. Audit timers exclude processing stages. Spark startup/cleanup and summary saving are outside cumulative totals. Values are components of this run, not separate S0-S2 experiments.",
     )
@@ -335,6 +414,7 @@ def main():
     print("S3 - CUMULATIVE PYSPARK RESULT")
     print("=" * 78)
     for label, value in [("Run ID", run_id), ("Laboratory environment", "S3"),
+                         ("Strategy under test", "S3"),
                          ("Dataset scale", scale), ("Source table", source_table),
                          ("Workflow start time", start_label), ("Workflow end time", end_label),
                          ("Execution status", status)]:
@@ -356,6 +436,10 @@ def main():
     for name, value in stages.items():
         show(name.replace("_", " ").title() + " status", value)
     show("Audit logging", audit_status)
+    show("S0 baseline workflow", "RETAINED")
+    show("S1 hash-chain verification", stages["hash_verification"])
+    show("S2 AES-GCM decryption", stages["decryption"])
+    show("S3 local DB availability check", stages["mysql_connectivity"])
     show("Parsed records", records)
     show("Verified records", verified_records)
     show("Output records (JDBC write completed)", metrics["output_records"] if write_state == "COMPLETED" else "UNKNOWN / NOT WRITTEN")
@@ -372,15 +456,21 @@ def main():
     show("Monitoring error", monitor.error or "N/A")
     show("Script-2 decision", "ALLOW" if status == "SUCCESS" and not save_error else "BLOCK")
     show("Number of script retries", 0)
+    show("Abnormal condition observed", "YES" if status != "SUCCESS" or save_error or monitor.error or cleanup_errors else "NO")
     show("Error / failure message", error)
     show("Cleanup errors", "; ".join(cleanup_errors) or "N/A")
     show("Audit log file", audit_path)
     show("Measurement record", result_path if not save_error else "SAVE FAILED: " + save_error)
     show("Total pipeline time", "N/A - Script-1 and dashboard not measured here")
     print("=" * 78)
+    print("SAVED JSON RESULT" if not save_error else "JSON RESULT - FILE SAVE FAILED")
+    if not save_error:
+        print(f"File: {result_path}")
+    print(json.dumps(metrics, indent=2))
+    print("=" * 78)
+    print_instrument_tables(metrics, save_error)
     return 0 if status == "SUCCESS" and not save_error else 1
 
 
 if __name__ == "__main__":
     sys.exit(main())
-
