@@ -240,6 +240,7 @@ def print_instrument_tables(metrics, save_error):
     ])
 
 def main():
+    print("Starting S3 PySpark: decryption, processing, verification, MySQL check/write and audit logging.", flush=True)
     os.umask(0o077)
     source_table = os.getenv("SOURCE_TABLE", "")
     scale, expected = DATASETS.get(source_table, ("UNKNOWN", None))
