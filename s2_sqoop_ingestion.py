@@ -1,24 +1,29 @@
+"""S2 cumulative measurements for Instrument 1.
+Required: SOURCE_TABLE, S2_AES_KEY_B64 and the relevant DB password.
+Keep the same AES key and S2_RESULTS_DIR for both scripts.
+Default result directory: /tmp/s2_results. Each script prints its saved JSON.
+S0/S1 entries are subtotals of this S2 run, not independent experiments.
+Total pipeline time sums S2 component totals, excluding manual gaps,
+Spark startup/cleanup, result matching/saving and Superset.
+CPU/memory are whole-VM samples, not process-specific utilization.
+Manually create /security_lab/s2 before running. This script never creates
+or removes that final directory; raw staging remains managed by Sqoop.
+No S3 availability/connectivity gate or audit log is added.
+AES-GCM uses the original nonce(12) + ciphertext + tag format.
+"""
 import base64
 import hashlib
+import json
+import math
 import os
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import uuid
 from datetime import datetime
-
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-
-
-REMOTE_DB = "jdbc:mysql://69.175.69.34/sumrachna_hd"
-USERNAME = "sumrachna_hd"
-PASSWORD = os.getenv("REMOTE_DB_PASSWORD")
-SOURCE_TABLE = os.getenv("SOURCE_TABLE")
-S2_AES_KEY_B64 = os.getenv("S2_AES_KEY_B64")
-
-RAW_HDFS_TARGET = "/security_lab/s2_raw"
-HDFS_TARGET = "/security_lab/s2"
+from pathlib import Path
 
 DATASETS = {
     "table_stock100": ("Small", 125),
@@ -26,309 +31,315 @@ DATASETS = {
     "table_stock4M": ("Large", 4248576),
 }
 
-if not PASSWORD or not SOURCE_TABLE or SOURCE_TABLE not in DATASETS:
-    print("ERROR: Set REMOTE_DB_PASSWORD and a valid SOURCE_TABLE.")
-    sys.exit(1)
+REMOTE_DB_HOST = os.getenv("REMOTE_DB_HOST", "69.175.69.34").strip()
+REMOTE_DB = f"jdbc:mysql://{REMOTE_DB_HOST}/sumrachna_hd"
+USERNAME = "sumrachna_hd"
+RAW_HDFS_TARGET = "/security_lab/s2_raw"
+HDFS_TARGET = "/security_lab/s2"
+HDFS_FILE = HDFS_TARGET + "/part-00000.enc"
 
-if not S2_AES_KEY_B64:
-    print("ERROR: Set S2_AES_KEY_B64.")
-    sys.exit(1)
-
-try:
-    AES_KEY = base64.b64decode(S2_AES_KEY_B64, validate=True)
-    if len(AES_KEY) != 32:
-        raise ValueError
-except Exception:
-    print("ERROR: S2_AES_KEY_B64 must decode to 32 bytes.")
-    sys.exit(1)
-
-DATASET_SCALE, EXPECTED_RECORDS = DATASETS[SOURCE_TABLE]
-
-cpu_samples = []
-memory_samples = []
-stop_event = threading.Event()
-
+def now():
+    return datetime.now().astimezone().isoformat(timespec="seconds")
 
 def cpu_values():
     with open("/proc/stat") as f:
-        values = list(map(float, f.readline().split()[1:9]))
-
+        values = list(map(int, f.readline().split()[1:9]))
     return sum(values), values[3] + values[4]
 
-
 def memory_percent():
-    values = {}
-
     with open("/proc/meminfo") as f:
-        for line in f:
-            key, value = line.split(":", 1)
-            values[key] = float(value.split()[0])
+        values = {line.split(":")[0]: int(line.split()[1]) for line in f}
+    return (1 - values["MemAvailable"] / values["MemTotal"]) * 100
 
-    return (
-        (values["MemTotal"] - values["MemAvailable"])
-        / values["MemTotal"]
-        * 100
-    )
+class Monitor:
+    def __init__(self):
+        self.cpu, self.memory = [], []
+        self.error = None
+        self.stop = threading.Event()
+        self.thread = threading.Thread(target=self.run, daemon=True)
 
+    def run(self):
+        try:
+            old_total, old_idle = cpu_values()
+            while not self.stop.wait(0.5):
+                total, idle = cpu_values()
+                if total > old_total:
+                    self.cpu.append((1 - (idle - old_idle) / (total - old_total)) * 100)
+                self.memory.append(memory_percent())
+                old_total, old_idle = total, idle
+        except Exception as exc:
+            self.error = str(exc)
 
-def monitor():
-    old_total, old_idle = cpu_values()
-
-    while not stop_event.wait(0.5):
-        total, idle = cpu_values()
-
-        if total > old_total:
-            cpu_samples.append(
-                (1 - (idle - old_idle) / (total - old_total)) * 100
-            )
-
-        memory_samples.append(memory_percent())
-        old_total, old_idle = total, idle
-
-
-def average(values):
-    return sum(values) / len(values) if values else 0.0
-
-
-def hdfs_size(path):
-    result = subprocess.run(
-        ["hdfs", "dfs", "-du", "-s", path],
-        capture_output=True,
-        text=True
-    )
-
-    try:
-        return int(result.stdout.split()[0]) / (1024 ** 2)
-    except (ValueError, IndexError):
-        return 0.0
-
-
-def create_hash_chain():
-    previous_hash = "GENESIS"
-    records = 0
-
-    hash_file = tempfile.NamedTemporaryFile(
-        mode="w",
-        delete=False,
-        suffix=".csv"
-    )
-
-    raw_process = subprocess.Popen(
-        [
-            "hdfs",
-            "dfs",
-            "-cat",
-            f"{RAW_HDFS_TARGET}/part*"
-        ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True
-    )
-
-    for line in raw_process.stdout:
-        row = line.rstrip("\r\n")
-
-        if not row:
-            continue
-
-        current_hash = hashlib.sha256(
-            f"{previous_hash}|{row}".encode("utf-8")
-        ).hexdigest()
-
-        hash_file.write(f"{row},{current_hash}\n")
-        previous_hash = current_hash
-        records += 1
-
-    hash_file.close()
-
-    error = raw_process.stderr.read()
-    return_code = raw_process.wait()
-
-    if return_code != 0:
-        os.unlink(hash_file.name)
-        raise RuntimeError(error)
-
-    if records != EXPECTED_RECORDS:
-        os.unlink(hash_file.name)
-        raise RuntimeError(
-            f"Expected {EXPECTED_RECORDS} records but found {records}"
+class Measurement:
+    def __init__(self, script, names, password_variable):
+        os.umask(0o077)
+        self.password = os.getenv(password_variable, "")
+        self.password_variable = password_variable
+        self.key_text = os.getenv("S2_AES_KEY_B64", "")
+        self.source = os.getenv("SOURCE_TABLE", "")
+        scale, self.expected = DATASETS.get(self.source, ("UNKNOWN", None))
+        self.directory = Path(os.getenv("S2_RESULTS_DIR", "/tmp/s2_results"))
+        self.monitor = Monitor()
+        self.monitor_started = False
+        self.started = time.perf_counter()
+        self.record = dict(
+            measurement_schema_version=1, run_id=uuid.uuid4().hex,
+            strategy="S2", script=script, dataset=scale, source_table=self.source,
+            expected_records=self.expected, output_records=None,
+            start=now(), status="FAILED", error="N/A",
+            component_seconds={name: 0.0 for name in names},
+            stage_status={name: "NOT RUN" for name in names},
+            retries=0, pipeline_total_seconds=None, cleanup_errors=[],
+            hdfs_bytes=None, hdfs_storage_mb=None,
+            resource_scope="whole host/VM",
         )
 
-    return hash_file.name, records
+    def validate(self):
+        if not self.password or self.source not in DATASETS:
+            raise ValueError(f"Set {self.password_variable} and a valid SOURCE_TABLE.")
+        try:
+            key = base64.b64decode(self.key_text, validate=True)
+            if len(key) != 32:
+                raise ValueError
+        except Exception:
+            raise ValueError("S2_AES_KEY_B64 must decode to exactly 32 bytes.") from None
+        return key
+
+    def redact(self, message):
+        text = str(message) or type(message).__name__
+        for secret in (self.password, self.key_text):
+            if secret:
+                text = text.replace(secret, "[REDACTED]")
+        return text
+
+    def start_monitor(self):
+        self.monitor.thread.start()
+        self.monitor_started = True
+
+    def stop_monitor(self):
+        self.monitor.stop.set()
+        if self.monitor_started:
+            self.monitor.thread.join()
+
+    def stage(self, name, action):
+        print(f"Starting {name}...", flush=True)
+        started = time.perf_counter()
+        try:
+            value = action()
+        except Exception:
+            self.record["stage_status"][name] = "FAIL"
+            raise
+        else:
+            self.record["stage_status"][name] = "PASS"
+            return value
+        finally:
+            self.record["component_seconds"][name] = time.perf_counter() - started
+
+    def finish(self):
+        r = self.record
+        r["end"] = now()
+        r["script_wall_seconds"] = time.perf_counter() - self.started
+        t = r["component_seconds"]
+        part = 1 if r["script"] == "sqoop" else 2
+        if part == 1:
+            s0 = t["sqoop"]
+            s1 = s0 + t["hash"]
+            s2 = s1 + t["encryption"]
+        else:
+            s0 = t["pyspark_processing"] + t["mysql_write"]
+            s1 = s0 + t["hash_verification"]
+            s2 = s1 + t["decryption"]
+        r["cumulative_seconds"] = {f"S{i}-Script-{part}": v for i, v in enumerate((s0,s1,s2))}
+        r["throughput_records_per_second"] = r["output_records"] / s2 if r["status"] == "SUCCESS" and s2 > 0 else None
+        for resource, samples in (("cpu",self.monitor.cpu),("memory",self.monitor.memory)):
+            r[resource + "_sample_count"] = len(samples)
+            r[resource + "_sample_sum"] = sum(samples)
+            r[resource + "_average_percent"] = sum(samples)/len(samples) if samples else None
+            r[resource + "_peak_percent"] = max(samples) if samples else None
+        r["monitoring_error"] = self.monitor.error
+        r["monitoring_window"] = ("ingestion through encryption/upload" if part == 1 else
+            "after Spark startup through write/temporary cleanup; includes result matching; excludes Spark cleanup")
+        r["resource_measurement_status"] = "COMPLETE" if self.monitor.cpu and self.monitor.memory and not self.monitor.error else "INCOMPLETE"
+        r["timing_note"] = (
+            "Hash includes HDFS read; encryption includes upload and size/fingerprint measurement. "
+            "Decryption includes HDFS download. Verification counted once. "
+            "Spark startup/cleanup, result matching/saving and manual gaps excluded from component totals. "
+            "S0/S1 are subtotals of this S2 run, not separate strategy experiments.")
+
+    def save_and_show(self):
+        r = self.record
+        path = self.directory / f"s2_{r['script']}_{r['run_id']}.json"
+        r["result_file"] = str(path.resolve())
+        save_error = None
+        try:
+            self.directory.mkdir(parents=True, exist_ok=True)
+            with path.open("x", encoding="utf-8") as output:
+                json.dump(r, output, indent=2, allow_nan=False)
+                output.write("\n")
+        except Exception as exc:
+            save_error = self.redact(exc)
+        print("=" * 76)
+        print(f"S2 - CUMULATIVE {r['script'].upper()} RESULT")
+        print(f"Execution status: {r['status']} | Run ID: {r['run_id']}")
+        for name, value in r["component_seconds"].items():
+            print(f"{name:<30}: {value:.6f} seconds | {r['stage_status'][name]}")
+        print("SAVED JSON RESULT" if not save_error else "JSON RESULT - SAVE FAILED: " + save_error)
+        print("File: " + str(path))
+        print(json.dumps(r, indent=2, allow_nan=False))
+        print_instrument_tables(r, save_error)
+        if r["script"] == "pyspark":
+            print_combined_instrument(r, save_error)
+        return 0 if r["status"] == "SUCCESS" and not save_error else 1
 
 
-def encrypt_and_upload(hash_file):
-    encrypted_file = tempfile.NamedTemporaryFile(
-        delete=False,
-        suffix=".enc"
-    )
+def fmt(value, digits=6):
+    return "N/A" if value is None else f"{value:.{digits}f}"
 
-    encrypted_file.close()
 
-    with open(hash_file, "rb") as source:
-        plaintext = source.read()
+def table(headers, rows):
+    print("| " + " | ".join(headers) + " |")
+    print("| " + " | ".join("---" for _ in headers) + " |")
+    for row in rows:
+        print("| " + " | ".join(str(v).replace("|", "/").replace("\n", " ").replace("\r", " ") for v in row) + " |")
 
+
+def print_instrument_tables(r, save_error):
+    part = 1 if r["script"] == "sqoop" else 2
+    print(f"\nB. Performance Measurement | S2 | Script-{part} | {r['dataset']}")
+    rows = []
+    for strategy in range(4):
+        for number in (1,2):
+            label = f"S{strategy}-Script-{number}"
+            value = "N/A - not tested" if strategy == 3 else (fmt(r["cumulative_seconds"].get(label)) if number == part else "N/A - other script")
+            rows.append((label, f"S{strategy}", "seconds", value))
+    total = fmt(r.get("pipeline_total_seconds"))
+    if part == 1:
+        total = "PENDING - matching PySpark run" if r["status"] == "SUCCESS" and not save_error else "N/A - ingestion incomplete"
+    rows.extend([
+        ("Local MySQL write time", "Current", "seconds", fmt(r["component_seconds"].get("mysql_write"))),
+        ("Total pipeline time", "Current", "seconds", total),
+        ("Throughput", "Current", "records/second", fmt(r["throughput_records_per_second"]) + " (this script only)"),
+        ("HDFS storage size", "Current", "MB", fmt(r.get("hdfs_storage_mb"))),
+        ("Output records", "Current", "records", r["output_records"] if r["output_records"] is not None else "N/A"),
+    ])
+    for label, field in (("Average CPU utilization","cpu_average_percent"), ("Peak CPU utilization","cpu_peak_percent"),
+                         ("Average memory utilization","memory_average_percent"), ("Peak memory utilization","memory_peak_percent")):
+        rows.append((label,"Current","%",fmt(r[field],2)))
+    table(["Metric","Strategy","Unit","Recorded Value"],rows)
+    print("S0/S1 are cumulative subtotals of this S2 run; S3 is not tested.")
+    print("Resources: whole VM, 0.5-second samples. Storage: encrypted file only, decimal MB.")
+    print("\nC. Execution Reliability")
+    success = r["status"] == "SUCCESS"
+    issues = [r["error"]] if r["error"] != "N/A" else []
+    if save_error:
+        issues.append("Measurement save failed: " + save_error)
+    notes = "Stages: " + "; ".join(f"{k}={v}" for k,v in r["stage_status"].items())
+    if part == 2:
+        notes += "; MySQL write: " + r["mysql_write_state"] + "; independent MySQL readback: NOT TESTED"
+    notes += "; resource measurement: " + r["resource_measurement_status"]
+    abnormal = not success or save_error or r["monitoring_error"] or r["cleanup_errors"]
+    table(["Field","Entry","Recorded Value"],[
+        ("Execution status","Success / Failure","Success" if success else "Failure"),
+        ("Retry required","Yes / No","No" if success and not save_error else "Review failure before retrying"),
+        ("Number of retries","count",0),
+        ("Error / failure message","text","; ".join(issues) or "N/A"),
+        ("Abnormal condition observed","Yes / No","Yes" if abnormal else "No"),
+        ("Notes","Text",notes),
+    ])
+    print("Automatic retries only; record manual reruns separately.")
+
+def run_command(args, **kwargs):
+    # Do not include command arguments in exceptions (credential hygiene).
+    result = subprocess.run(args, **kwargs)
+    if result.returncode:
+        raise RuntimeError(f"{args[0]} failed with exit code {result.returncode}; see terminal output.")
+    return result
+
+def digest_file(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+def create_hash_chain(path, expected):
+    previous_hash, count = "GENESIS", 0
+    # stderr is inherited: a full stderr pipe cannot deadlock the reader.
+    with open(path, "w", encoding="utf-8", newline="\n") as target:
+        process = subprocess.Popen(
+            ["hdfs", "dfs", "-cat", RAW_HDFS_TARGET + "/part*"],
+            stdout=subprocess.PIPE, text=True, encoding="utf-8",
+        )
+        try:
+            for line in process.stdout:
+                row = line.rstrip("\r\n")
+                if not row:
+                    continue
+                previous_hash = hashlib.sha256(
+                    f"{previous_hash}|{row}".encode("utf-8")
+                ).hexdigest()
+                target.write(f"{row},{previous_hash}\n")
+                count += 1
+            if process.wait() != 0:
+                raise RuntimeError("Unable to read raw HDFS data; see terminal output.")
+        finally:
+            process.stdout.close()
+            if process.poll() is None:
+                process.terminate()
+                process.wait()
+    if count != expected:
+        raise RuntimeError(f"Expected {expected} records but found {count}.")
+    return count
+
+def encrypt_and_upload(hash_file, encrypted_file, key):
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
     nonce = os.urandom(12)
-    ciphertext = AESGCM(AES_KEY).encrypt(
-        nonce,
-        plaintext,
-        None
-    )
+    # Preserves the S2 wire format: nonce(12) + ciphertext + GCM tag(16).
+    plaintext = hash_file.read_bytes()
+    encrypted_file.write_bytes(nonce + AESGCM(key).encrypt(nonce, plaintext, None))
+    # Final directory is created manually; replace only its encrypted file.
+    run_command(["hdfs", "dfs", "-put", "-f", str(encrypted_file), HDFS_FILE])
+    result = run_command(["hdfs", "dfs", "-stat", "%b", HDFS_FILE],
+                         capture_output=True, text=True, timeout=60)
+    size = int(result.stdout.strip())
+    if size <= 28 or size != encrypted_file.stat().st_size:
+        raise RuntimeError("Uploaded encrypted file size differs from the local output.")
+    # Used by PySpark to match the exact downloaded ciphertext to this run.
+    # This is a local fingerprint, not an independent HDFS content readback.
+    return size, digest_file(encrypted_file)
 
-    with open(encrypted_file.name, "wb") as target:
-        target.write(nonce)
-        target.write(ciphertext)
-
-    subprocess.run(
-        ["hdfs", "dfs", "-rm", "-r", "-f", HDFS_TARGET],
-        check=False
-    )
-
-    subprocess.run(
-        ["hdfs", "dfs", "-mkdir", "-p", HDFS_TARGET],
-        check=True
-    )
-
-    subprocess.run(
-        [
-            "hdfs",
-            "dfs",
-            "-put",
-            "-f",
-            encrypted_file.name,
-            f"{HDFS_TARGET}/part-00000.enc"
-        ],
-        check=True
-    )
-
-    os.unlink(encrypted_file.name)
-
-
-start_label = datetime.now().astimezone().isoformat(
-    timespec="seconds"
-)
-
-monitor_thread = threading.Thread(
-    target=monitor,
-    daemon=True
-)
-monitor_thread.start()
-
-status = "FAILED"
-error_message = "N/A"
-
-sqoop_time = 0.0
-hash_time = 0.0
-encryption_time = 0.0
-records = 0
-hash_file = None
-
-try:
-    sqoop_command = [
-        "sqoop",
-        "import",
-        "--connect",
-        REMOTE_DB,
-        "--username",
-        USERNAME,
-        "--password",
-        PASSWORD,
-        "--table",
-        SOURCE_TABLE,
-        "--target-dir",
-        RAW_HDFS_TARGET,
-        "--delete-target-dir"
-    ]
-
-    sqoop_start = time.perf_counter()
-    result = subprocess.run(sqoop_command)
-    sqoop_time = time.perf_counter() - sqoop_start
-
-    if result.returncode != 0:
-        raise RuntimeError("Sqoop ingestion failed.")
-
-    hash_start = time.perf_counter()
-    hash_file, records = create_hash_chain()
-    hash_time = time.perf_counter() - hash_start
-
-    encryption_start = time.perf_counter()
-    encrypt_and_upload(hash_file)
-    encryption_time = time.perf_counter() - encryption_start
-
-    status = "SUCCESS"
-
-except Exception as exc:
-    error_message = str(exc)
-
-finally:
-    if hash_file and os.path.exists(hash_file):
-        os.unlink(hash_file)
-
-    stop_event.set()
-    monitor_thread.join()
+def main():
+    print("Starting S2 Sqoop ingestion, hash chain and AES-GCM encryption...", flush=True)
+    m = Measurement("sqoop", ("sqoop","hash","encryption"), "REMOTE_DB_PASSWORD")
+    r = m.record
+    r.update(hashed_records=0, ciphertext_sha256=None, hdfs_file=HDFS_FILE,
+             hdfs_upload_size_verified="NOT VERIFIED", hdfs_content_readback="NOT TESTED")
+    try:
+        key = m.validate()
+        m.start_monitor()
+        with tempfile.TemporaryDirectory(prefix="s2_sqoop_") as temporary:
+            work = Path(temporary)
+            password_file = work / "password"
+            password_file.write_text(m.password, encoding="utf-8")
+            password_file.chmod(0o400)
+            command = ["sqoop", "import", "--connect", REMOTE_DB,
+                       "--username", USERNAME, "--password-file", password_file.as_uri(),
+                       "--table", m.source, "--target-dir", RAW_HDFS_TARGET, "--delete-target-dir"]
+            m.stage("sqoop", lambda: run_command(command))
+            hashed, encrypted = work / "hashed.csv", work / "data.enc"
+            count = m.stage("hash", lambda: create_hash_chain(hashed, m.expected))
+            r["hashed_records"] = count
+            size, fingerprint = m.stage("encryption", lambda: encrypt_and_upload(hashed, encrypted, key))
+            r.update(output_records=count, hdfs_bytes=size, hdfs_storage_mb=size/1_000_000,
+                     ciphertext_sha256=fingerprint, hdfs_upload_size_verified="PASS")
+        r["status"] = "SUCCESS"
+    except Exception as exc:
+        r["error"] = m.redact(exc)
+    finally:
+        m.stop_monitor()
+    m.finish()
+    return m.save_and_show()
 
 
-end_label = datetime.now().astimezone().isoformat(
-    timespec="seconds"
-)
-
-s0_script1_time = sqoop_time
-s1_script1_time = s0_script1_time + hash_time
-s2_script1_time = s1_script1_time + encryption_time
-
-storage_size = (
-    hdfs_size(HDFS_TARGET)
-    if status == "SUCCESS"
-    else 0.0
-)
-
-print("=" * 72)
-print("S2 - SQOOP, HASH-CHAIN, AND AES-GCM RESULT")
-print("=" * 72)
-print("Laboratory environment                : S2")
-print("Strategy under test                   : S2")
-print(f"Dataset scale                         : {DATASET_SCALE}")
-print(f"Source table                          : {SOURCE_TABLE}")
-print(f"Workflow start time                   : {start_label}")
-print(f"Workflow end time                     : {end_label}")
-print(f"Execution status                      : {status}")
-print(f"S0-Script-1 time                      : {s0_script1_time:.2f} seconds")
-print(f"Hash-chain time                       : {hash_time:.2f} seconds")
-print(f"S1-Script-1 total time                : {s1_script1_time:.2f} seconds")
-print(f"AES-GCM encryption time               : {encryption_time:.2f} seconds")
-print(f"S2-Script-1 total time                : {s2_script1_time:.2f} seconds")
-print(
-    "HDFS output verified                  : "
-    f"{'PASS' if status == 'SUCCESS' else 'FAIL'}"
-)
-print(f"HDFS storage size                     : {storage_size:.4f} MB")
-print(f"Output records                        : {records}")
-print(f"Average CPU utilization               : {average(cpu_samples):.2f}%")
-print(
-    f"Peak CPU utilization                  : "
-    f"{max(cpu_samples) if cpu_samples else 0.0:.2f}%"
-)
-print(f"Average memory utilization            : {average(memory_samples):.2f}%")
-print(
-    f"Peak memory utilization               : "
-    f"{max(memory_samples) if memory_samples else 0.0:.2f}%"
-)
-print("Retry required                        : NO")
-print("Number of retries                     : 0")
-print(f"Error / failure message               : {error_message}")
-print(
-    "Abnormal condition observed           : "
-    f"{'NO' if status == 'SUCCESS' else 'YES'}"
-)
-print("S0 baseline workflow                  : RETAINED")
-print(
-    "S1 hash-chain protection              : "
-    f"{'PASS' if status == 'SUCCESS' else 'FAIL'}"
-)
-print(
-    "S2 AES-GCM protection                 : "
-    f"{'PASS' if status == 'SUCCESS' else 'FAIL'}"
-)
-print("=" * 72)
-
-sys.exit(0 if status == "SUCCESS" else 1)
+if __name__ == "__main__":
+    sys.exit(main())
