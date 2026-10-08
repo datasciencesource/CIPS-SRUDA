@@ -10,10 +10,16 @@ saving are outside cumulative component totals and reported separately.
 S2 processing order is retained: decrypt, parse/count, verify, write.
 S3 adds the connectivity gate before writing and timed audit events.
 Resource monitoring excludes Spark startup and shutdown, as in S2.
+Run the updated Sqoop script first and retain its JSON in S3_RESULTS_DIR.
+PySpark automatically matches its input ciphertext to exactly one Sqoop JSON.
+Optional S3_SQOOP_RESULT selects an explicit JSON; mismatches block writing.
+Final Instrument 1 table combines both runs. Total is active component time,
+not elapsed terminal-to-Superset time. Separate script metrics remain available.
 """
 import base64
 import hashlib
 import json
+import math
 import os
 import subprocess
 import sys
@@ -88,7 +94,7 @@ def decrypt_hdfs_file(work, key):
     except InvalidTag:
         raise RuntimeError("AES-GCM authentication failed: wrong key or altered data.") from None
     decrypted.write_bytes(plaintext)
-    return decrypted
+    return decrypted, encrypted
 
 
 def verify_hash_chain(path, expected):
@@ -194,7 +200,7 @@ def print_instrument_tables(metrics, save_error):
     rows.extend([
         ("Local MySQL write time", "Current", "seconds",
          formatted(metrics["component_seconds"].get("mysql_write"))),
-        ("Total pipeline time", "Current", "seconds", "N/A - whole pipeline not measured"),
+        ("Total pipeline time", "Current", "seconds", formatted(metrics.get("pipeline_total_seconds"))),
         ("Throughput", "Current", "records/second", formatted(rate) + " (this script only)" if rate is not None else "N/A"),
         ("HDFS storage size", "Current", "MB", formatted(metrics.get("hdfs_storage_mb"))),
         ("Output records", "Current", "records", metrics["output_records"] if metrics["output_records"] is not None else "N/A"),
@@ -239,6 +245,139 @@ def print_instrument_tables(metrics, save_error):
         ("Notes", "Text", notes),
     ])
 
+
+def match_sqoop_result(encrypted_file, results_dir, source_table, expected):
+    """Bind measurements to the exact ciphertext downloaded by this run.
+
+    Explicit S3_SQOOP_RESULT wins. Otherwise require exactly one matching
+    successful record; never choose an unrelated file by modification time.
+    Matching is measurement bookkeeping, not an authorization mechanism.
+    """
+    digest = hashlib.sha256()
+    with encrypted_file.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    fingerprint = digest.hexdigest()
+    selected = os.getenv("S3_SQOOP_RESULT")
+    paths = [Path(selected)] if selected else sorted(results_dir.glob("s3_sqoop_*.json"))
+    matches = []
+    for path in paths:
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(record, dict):
+                raise ValueError("Result is not a JSON object")
+            if (record.get("measurement_schema_version") != 2
+                    or record.get("ciphertext_sha256") != fingerprint
+                    or record.get("strategy") != "S3" or record.get("script") != "sqoop"
+                    or record.get("source_table") != source_table
+                    or record.get("dataset") != DATASETS[source_table][0]
+                    or record.get("expected_records") != expected
+                    or record.get("output_records") != expected
+                    or record.get("hdfs_bytes") != encrypted_file.stat().st_size
+                    or record.get("hdfs_file") != "/security_lab/s3/part-00000.enc"
+                    or record.get("status") != "SUCCESS"
+                    or record.get("audit_status") != "PASS"
+                    or any(record.get("stage_status", {}).get(name) != "PASS"
+                           for name in ("sqoop", "hash", "encryption", "hdfs_availability"))):
+                raise ValueError("Result does not match the successful S3 ingestion and ciphertext")
+            components = record["component_seconds"]
+            running = 0.0
+            for level, names in enumerate((("sqoop",), ("hash",), ("encryption",),
+                                           ("hdfs_availability", "audit_logging"))):
+                for name in names:
+                    value = components[name]
+                    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+                        raise ValueError("Invalid component timing")
+                    running += value
+                actual = record["cumulative_seconds"][f"S{level}-Script-1"]
+                if not isinstance(actual, (int, float)) or not math.isfinite(actual) or not math.isclose(actual, running, abs_tol=1e-7):
+                    raise ValueError("Inconsistent cumulative timing")
+            if running <= 0 or not record.get("run_id"):
+                raise ValueError("Missing run ID or positive duration")
+            matches.append((path, record))
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            if selected:
+                raise RuntimeError(f"Selected Sqoop result is invalid: {exc}") from None
+    if len(matches) != 1:
+        raise RuntimeError(
+            "Cannot uniquely match this encrypted input to a successful updated Sqoop result. "
+            "Run the updated Sqoop script first, keep its JSON, and use the same S3_RESULTS_DIR; "
+            "or set S3_SQOOP_RESULT to its exact JSON path. MySQL write has not started.")
+    path, record = matches[0]
+    return record, str(path.resolve()), fingerprint
+
+
+def combine_results(sqoop, pyspark):
+    """Sum disjoint component timings; count the final dataset only once."""
+    if sqoop["status"] != "SUCCESS" or pyspark["status"] != "SUCCESS":
+        raise ValueError("Combined successful measurements require both scripts to succeed")
+    if sqoop["output_records"] != pyspark["output_records"]:
+        raise ValueError("Output record counts differ")
+    total = sqoop["cumulative_seconds"]["S3-Script-1"] + pyspark["cumulative_seconds"]["S3-Script-2"]
+    result = dict(
+        status="SUCCESS", sqoop_run_id=sqoop["run_id"], pyspark_run_id=pyspark["run_id"],
+        cumulative_seconds={**sqoop["cumulative_seconds"], **pyspark["cumulative_seconds"]},
+        total_pipeline_seconds=total,
+        throughput_records_per_second=pyspark["output_records"] / total,
+        output_records=pyspark["output_records"],
+        hdfs_bytes=sqoop["hdfs_bytes"], hdfs_storage_mb=sqoop["hdfs_bytes"] / 1_000_000,
+        mysql_write_seconds=pyspark["component_seconds"]["mysql_write"],
+        script_wall_seconds_sum=sqoop["script_wall_seconds"] + pyspark["script_wall_seconds"],
+        timing_scope="Sum of S3 component totals; excludes gaps, Spark startup/cleanup, result matching/saving, and Superset",
+        resource_scope="Whole VM; pooled 0.5-second samples from both active monitoring windows; excludes gap and Spark startup/cleanup",
+        mysql_output_independently_verified=pyspark["mysql_output_independently_verified"],
+        automatic_retries=sqoop["retries"] + pyspark["retries"],
+    )
+    for resource in ("cpu", "memory"):
+        counts = [r.get(resource + "_sample_count", 0) for r in (sqoop, pyspark)]
+        peaks = [r.get(resource + "_peak_percent") for r in (sqoop, pyspark)]
+        valid = all(isinstance(n, int) and n > 0 for n in counts) and all(
+            not r.get("monitoring_error") for r in (sqoop, pyspark))
+        result[resource + "_average_percent"] = (
+            sum(r[resource + "_sample_sum"] for r in (sqoop, pyspark)) / sum(counts) if valid else None)
+        result[resource + "_peak_percent"] = max(peaks) if valid and all(v is not None for v in peaks) else None
+    result["resource_measurement_status"] = "COMPLETE" if all(
+        result[x + "_average_percent"] is not None for x in ("cpu", "memory")) else "INCOMPLETE"
+    return result
+
+
+def print_combined_instrument(metrics, save_error):
+    result = metrics.get("pipeline_result")
+    print("\nINSTRUMENT 1 - COMBINED S3 PIPELINE RESULT")
+    if result is None:
+        print("Combined result unavailable: " + metrics.get("pipeline_measurement_error", "Pipeline did not complete"))
+        return
+    def fmt(value, digits=6):
+        return "N/A - incomplete monitoring" if value is None else f"{value:.{digits}f}"
+    rows = [(f"S{s}-Script-{part}", f"S{s}", "seconds",
+             fmt(result["cumulative_seconds"][f"S{s}-Script-{part}"]))
+            for s in range(4) for part in (1, 2)]
+    rows += [
+        ("Local MySQL write time", "Current", "seconds", fmt(result["mysql_write_seconds"])),
+        ("Total pipeline time", "Current", "seconds", fmt(result["total_pipeline_seconds"])),
+        ("Throughput", "Current", "records/second", fmt(result["throughput_records_per_second"])),
+        ("HDFS storage size", "Current", "MB", fmt(result["hdfs_storage_mb"])),
+        ("Output records", "Current", "records", result["output_records"]),
+    ]
+    for label, field in (("Average CPU utilization", "cpu_average_percent"),
+                         ("Peak CPU utilization", "cpu_peak_percent"),
+                         ("Average memory utilization", "memory_average_percent"),
+                         ("Peak memory utilization", "memory_peak_percent")):
+        rows.append((label, "Current", "%", fmt(result[field], 2)))
+    print("| Metric | Strategy | Unit | Recorded Value |")
+    print("| --- | --- | --- | --- |")
+    for row in rows:
+        print("| " + " | ".join(map(str, row)) + " |")
+    print("Timing scope: " + result["timing_scope"])
+    print("Resource scope: " + result["resource_scope"])
+    print("S0-S2 rows are subtotals of this S3 run, not separate strategy experiments.")
+    print("HDFS size is the encrypted file only; decimal MB, excluding raw staging and replicas.")
+    print("Output count is based on completed JDBC write; independent MySQL readback: " + result["mysql_output_independently_verified"])
+    print("Automatic retries: " + str(result["automatic_retries"]) + "; record manual reruns separately.")
+    print("Resource measurement: " + result["resource_measurement_status"])
+    print("Measurement file: " + ("SAVE FAILED: " + save_error if save_error else metrics["result_file"]))
+
+
 def main():
     print("Starting S3 PySpark: decryption, processing, verification, MySQL check/write and audit logging.", flush=True)
     os.umask(0o077)
@@ -260,6 +399,9 @@ def main():
     spark = data = None
     spark_startup_time = spark_cleanup_time = 0.0
     cleanup_errors = []
+    sqoop_result = None
+    sqoop_result_path = ciphertext_sha256 = None
+    result_matching_seconds = 0.0
     start_label = now()
     workflow_start = time.perf_counter()
     monitor = Monitor()
@@ -330,7 +472,16 @@ def main():
         monitor.thread.start()
         monitor_started = True
         with tempfile.TemporaryDirectory(prefix="s3_pyspark_") as temporary:
-            decrypted_file = stage("decryption", lambda: decrypt_hdfs_file(Path(temporary), key))
+            decrypted_file, encrypted_file = stage("decryption", lambda: decrypt_hdfs_file(Path(temporary), key))
+            # Measurement matching is outside all S0-S3 component totals.
+            match_start = time.perf_counter()
+            try:
+                sqoop_result, sqoop_result_path, ciphertext_sha256 = match_sqoop_result(
+                    encrypted_file, results_dir, source_table, expected)
+            finally:
+                result_matching_seconds = time.perf_counter() - match_start
+            audit("SQOOP_RESULT_MATCHED", "PASS", sqoop_run_id=sqoop_result["run_id"])
+
             data, records = stage("pyspark_processing", lambda: process_data(spark, decrypted_file, expected))
             verified_records = stage("hash_verification", lambda: verify_hash_chain(decrypted_file, expected))
             # Gate the write immediately before it starts.
@@ -396,9 +547,21 @@ def main():
         cpu_sample_count=len(monitor.cpu), memory_sample_count=len(monitor.memory),
         cpu_sample_sum=sum(monitor.cpu), memory_sample_sum=sum(monitor.memory),
         retries=0, pipeline_total_seconds=None,
+        measurement_schema_version=2, ciphertext_sha256=ciphertext_sha256,
+        sqoop_result_file=sqoop_result_path,
+        sqoop_run_id=sqoop_result["run_id"] if sqoop_result else None,
+        result_matching_seconds=result_matching_seconds,
+        pipeline_result=None, pipeline_measurement_error="Pipeline did not complete successfully",
+
         timing_note="Decryption includes HDFS download. Verification is added once. Audit timers exclude processing stages. Spark startup/cleanup and summary saving are outside cumulative totals. Values are components of this run, not separate S0-S2 experiments.",
     )
     result_path = results_dir / ("s3_pyspark_" + run_id + ".json")
+    metrics["result_file"] = str(result_path.resolve())
+    if status == "SUCCESS" and sqoop_result is not None:
+        metrics["pipeline_result"] = combine_results(sqoop_result, metrics)
+        metrics["pipeline_total_seconds"] = metrics["pipeline_result"]["total_pipeline_seconds"]
+        metrics["pipeline_throughput_records_per_second"] = metrics["pipeline_result"]["throughput_records_per_second"]
+        metrics["pipeline_measurement_error"] = None
     save_error = None
     try:
         results_dir.mkdir(parents=True, exist_ok=True)
@@ -462,7 +625,9 @@ def main():
     show("Cleanup errors", "; ".join(cleanup_errors) or "N/A")
     show("Audit log file", audit_path)
     show("Measurement record", result_path if not save_error else "SAVE FAILED: " + save_error)
-    show("Total pipeline time", "N/A - Script-1 and dashboard not measured here")
+    total = metrics["pipeline_total_seconds"]
+    show("Total pipeline processing time", f"{total:.6f} seconds" if total is not None else "N/A - workflow incomplete")
+    show("Result matching time (outside totals)", f"{result_matching_seconds:.6f} seconds")
     print("=" * 78)
     print("SAVED JSON RESULT" if not save_error else "JSON RESULT - FILE SAVE FAILED")
     if not save_error:
@@ -470,6 +635,7 @@ def main():
     print(json.dumps(metrics, indent=2))
     print("=" * 78)
     print_instrument_tables(metrics, save_error)
+    print_combined_instrument(metrics, save_error)
     return 0 if status == "SUCCESS" and not save_error else 1
 
 
