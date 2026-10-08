@@ -10,7 +10,9 @@ saving are outside cumulative component totals and reported separately.
 S2 processing order is retained: decrypt, parse/count, verify, write.
 S3 adds the connectivity gate before writing and timed audit events.
 Resource monitoring excludes Spark startup and shutdown, as in S2.
-Run the updated Sqoop script first and retain its JSON in S3_RESULTS_DIR.
+Run the directory-check version of Sqoop first and retain its JSON in S3_RESULTS_DIR.
+Only schema-3 ingestion results are accepted, preventing mixing the earlier
+post-upload dataset-check measurement with the revised directory check.
 PySpark automatically matches its input ciphertext to exactly one Sqoop JSON.
 Optional S3_SQOOP_RESULT selects an explicit JSON; mismatches block writing.
 Final Instrument 1 table combines both runs. Total is active component time,
@@ -223,7 +225,7 @@ def print_instrument_tables(metrics, save_error):
     abnormal = not success or bool(metrics.get("monitoring_error")) or bool(metrics.get("cleanup_errors"))
     if success and script == "sqoop":
         notes = (f"S3 ingestion completed; {metrics['output_records']} records hash-chained and encrypted; "
-                 "HDFS availability checked and audit events recorded.")
+                 "HDFS target-directory check passed before ingestion; audit events recorded.")
     elif success:
         notes = (f"S3 processing completed; {metrics['verified_records']} records verified; "
                  f"JDBC write completed for {metrics['output_records']} records; "
@@ -266,7 +268,9 @@ def match_sqoop_result(encrypted_file, results_dir, source_table, expected):
             record = json.loads(path.read_text(encoding="utf-8"))
             if not isinstance(record, dict):
                 raise ValueError("Result is not a JSON object")
-            if (record.get("measurement_schema_version") != 2
+            if (record.get("measurement_schema_version") != 3
+                    or record.get("hdfs_availability_scope") != "target-directory existence before ingestion"
+                    or record.get("hdfs_upload_size_verified") != "PASS"
                     or record.get("ciphertext_sha256") != fingerprint
                     or record.get("strategy") != "S3" or record.get("script") != "sqoop"
                     or record.get("source_table") != source_table
@@ -315,6 +319,8 @@ def combine_results(sqoop, pyspark):
         raise ValueError("Output record counts differ")
     total = sqoop["cumulative_seconds"]["S3-Script-1"] + pyspark["cumulative_seconds"]["S3-Script-2"]
     result = dict(
+        measurement_schema_version=3,
+        hdfs_availability_scope=sqoop["hdfs_availability_scope"],
         status="SUCCESS", sqoop_run_id=sqoop["run_id"], pyspark_run_id=pyspark["run_id"],
         cumulative_seconds={**sqoop["cumulative_seconds"], **pyspark["cumulative_seconds"]},
         total_pipeline_seconds=total,
@@ -343,7 +349,7 @@ def combine_results(sqoop, pyspark):
 
 def print_combined_instrument(metrics, save_error):
     result = metrics.get("pipeline_result")
-    print("\nINSTRUMENT 1 - COMBINED S3 PIPELINE RESULT")
+    print("\nB. Performance Measurement - INSTRUMENT 1 - COMBINED S3 PIPELINE RESULT")
     if result is None:
         print("Combined result unavailable: " + metrics.get("pipeline_measurement_error", "Pipeline did not complete"))
         return
@@ -495,7 +501,7 @@ def main():
 
             stage("mysql_write", save_output)
         audit("WORKFLOW_COMPLETED", "PASS", "Script-2 complete; ALLOW downstream use.",
-              records=records, verified_records=verified_records)
+              decision="ALLOW", records=records, verified_records=verified_records)
         status = "SUCCESS"
     except Exception as exc:
         error = redact(exc)
@@ -547,7 +553,7 @@ def main():
         cpu_sample_count=len(monitor.cpu), memory_sample_count=len(monitor.memory),
         cpu_sample_sum=sum(monitor.cpu), memory_sample_sum=sum(monitor.memory),
         retries=0, pipeline_total_seconds=None,
-        measurement_schema_version=2, ciphertext_sha256=ciphertext_sha256,
+        measurement_schema_version=3, ciphertext_sha256=ciphertext_sha256,
         sqoop_result_file=sqoop_result_path,
         sqoop_run_id=sqoop_result["run_id"] if sqoop_result else None,
         result_matching_seconds=result_matching_seconds,
