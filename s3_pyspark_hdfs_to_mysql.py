@@ -1,6 +1,7 @@
 """S3 Script-2: baseline + verification + decryption + DB check + audit.
 
 Required: LOCAL_DB_PASSWORD, SOURCE_TABLE, S2_AES_KEY_B64.
+Optional: LOCAL_DB_HOST (default 127.0.0.1), used for both JDBC check and write.
 Use the SAME key as S3 Sqoop. No S3_AUTH_TOKEN is needed.
 Run with spark-submit and the existing MySQL Connector/J jar.
 Append mode is retained: the script never clears the destination table.
@@ -33,7 +34,8 @@ from datetime import datetime
 from pathlib import Path
 
 HDFS_INPUT = "hdfs:///security_lab/s3/part-00000.enc"
-MYSQL_URL = ("jdbc:mysql://127.0.0.1:3306/dbtest"
+MYSQL_HOST = os.getenv("LOCAL_DB_HOST", "127.0.0.1").strip()
+MYSQL_URL = (f"jdbc:mysql://{MYSQL_HOST}:3306/dbtest"
              "?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC")
 MYSQL_TABLE = "table_stock"
 MYSQL_USER = "usertest"
