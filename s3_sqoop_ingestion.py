@@ -2,8 +2,10 @@
 
 Required: REMOTE_DB_PASSWORD, SOURCE_TABLE, S2_AES_KEY_B64.
 No authorization token is required. Keep the same AES key for Script-2.
-As in S2, a run replaces /security_lab/s3_raw and the final encrypted file.
-Hash time includes reading raw HDFS data; encryption time includes upload.
+The target /security_lab/s3 must already exist; this script never creates or removes it.
+Raw staging /security_lab/s3_raw is still managed by Sqoop.
+Indicator 10 checks the target directory before ingestion; uploads replace only the encrypted file.
+Hash time includes reading raw HDFS data; encryption time includes upload and output size/fingerprint measurement.
 Audit writes are timed separately, outside all processing-stage timers.
 S2's ingestion, hashing, encryption/upload order is retained.
 HDFS storage is reported in decimal MB (bytes / 1,000,000).
@@ -122,21 +124,34 @@ def encrypt_and_upload(hash_file, encrypted_file, key):
     # Preserves the S2 wire format: nonce(12) + ciphertext + GCM tag(16).
     plaintext = hash_file.read_bytes()
     encrypted_file.write_bytes(nonce + AESGCM(key).encrypt(nonce, plaintext, None))
-    # Retain S2's replacement of the strategy output directory.
-    run_command(["hdfs", "dfs", "-rm", "-r", "-f", HDFS_TARGET])
-    run_command(["hdfs", "dfs", "-mkdir", "-p", HDFS_TARGET])
+    # The existing target directory is never created or removed by this script.
     run_command(["hdfs", "dfs", "-put", "-f", str(encrypted_file), HDFS_FILE])
+    result = run_command(["hdfs", "dfs", "-stat", "%b", HDFS_FILE],
+                         capture_output=True, text=True, timeout=60)
+    size = int(result.stdout.strip())
+    if size <= 28 or size != encrypted_file.stat().st_size:
+        raise RuntimeError("Uploaded encrypted file size differs from the local output.")
+    # Used by PySpark to match the exact downloaded ciphertext to this run.
+    # This is a local fingerprint, not an independent HDFS content readback.
+    return size, digest_file(encrypted_file)
 
 
-def check_hdfs_availability(encrypted_file, downloaded_file):
-    # Check the actual dataset, not just the NameNode or directory.
-    run_command(["hdfs", "dfs", "-test", "-s", HDFS_FILE], timeout=60)
-    run_command(["hdfs", "dfs", "-get", HDFS_FILE, str(downloaded_file)], timeout=300)
-    size = downloaded_file.stat().st_size
-    fingerprint = digest_file(downloaded_file)
-    if size != encrypted_file.stat().st_size or fingerprint != digest_file(encrypted_file):
-        raise RuntimeError("S3 HDFS dataset differs from the encrypted output; workflow blocked.")
-    return size, fingerprint
+def check_hdfs_availability():
+    """Indicator 10: existing target-directory gate, before any Sqoop import."""
+    try:
+        result = subprocess.run(
+            ["hdfs", "dfs", "-test", "-d", HDFS_TARGET], timeout=60
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        raise RuntimeError(
+            f"Cannot check HDFS target directory {HDFS_TARGET}; Sqoop ingestion blocked."
+        ) from None
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"HDFS target directory {HDFS_TARGET} is missing, is not a directory, "
+            "or cannot be checked; Sqoop ingestion blocked. "
+            "The script does not create the target directory."
+        )
 
 
 
@@ -187,7 +202,7 @@ def print_instrument_tables(metrics, save_error):
     abnormal = not success or bool(metrics.get("monitoring_error")) or bool(metrics.get("cleanup_errors"))
     if success and script == "sqoop":
         notes = (f"S3 ingestion completed; {metrics['output_records']} records hash-chained and encrypted; "
-                 "HDFS availability checked and audit events recorded.")
+                 "HDFS target-directory check passed before ingestion; audit events recorded.")
     elif success:
         notes = (f"S3 processing completed; {metrics['verified_records']} records verified; "
                  f"JDBC write completed for {metrics['output_records']} records; "
@@ -281,6 +296,7 @@ def main():
                 raise ValueError
         except Exception:
             raise ValueError("S2_AES_KEY_B64 must decode to exactly 32 bytes.") from None
+        stage("hdfs_availability", check_hdfs_availability)
         with tempfile.TemporaryDirectory(prefix="s3_sqoop_") as temporary:
             work = Path(temporary)
             password_file = work / "password"
@@ -293,10 +309,9 @@ def main():
             stage("sqoop", lambda: run_command(command))
             hash_file, encrypted_file = work / "hashed.csv", work / "data.enc"
             records = stage("hash", lambda: create_hash_chain(hash_file, expected))
-            stage("encryption", lambda: encrypt_and_upload(hash_file, encrypted_file, key))
-            storage_bytes, ciphertext_sha256 = stage("hdfs_availability", lambda: check_hdfs_availability(
-                encrypted_file, work / "readback.enc"))
-        audit("WORKFLOW_COMPLETED", "PASS", "Script-1 complete; ALLOW handoff to Script-2.", records=records)
+            storage_bytes, ciphertext_sha256 = stage(
+                "encryption", lambda: encrypt_and_upload(hash_file, encrypted_file, key))
+        audit("WORKFLOW_COMPLETED", "PASS", "Script-1 complete; ALLOW handoff to Script-2.", decision="ALLOW", records=records)
         status = "SUCCESS"
     except Exception as exc:
         error = redact(exc)
@@ -326,17 +341,21 @@ def main():
         cumulative_seconds={"S0-Script-1": s0, "S1-Script-1": s1, "S2-Script-1": s2, "S3-Script-1": s3},
         script_wall_seconds=wall_time, stage_status=stages, audit_status=audit_status,
         hdfs_file=HDFS_FILE, hdfs_bytes=storage_bytes, ciphertext_sha256=ciphertext_sha256,
-        measurement_schema_version=2,
+        measurement_schema_version=3,
+        hdfs_availability_scope="target-directory existence before ingestion",
+        hdfs_target_directory=HDFS_TARGET,
+        hdfs_upload_size_verified="PASS" if storage_bytes is not None else "NOT VERIFIED",
+        hdfs_content_readback="NOT TESTED",
         hdfs_storage_mb=storage_bytes / 1_000_000 if storage_bytes is not None else None,
         throughput_records_per_second=records / s3 if status == "SUCCESS" and s3 else None,
         cpu_average_percent=mean(monitor.cpu), cpu_peak_percent=max(monitor.cpu, default=None),
         memory_average_percent=mean(monitor.memory), memory_peak_percent=max(monitor.memory, default=None),
         resource_scope="whole host/VM", monitoring_error=monitor.error,
-        monitoring_window="ingestion through encryption/upload, availability check and workflow completion",
+        monitoring_window="target-directory check through ingestion, encryption/upload and workflow completion",
         cpu_sample_count=len(monitor.cpu), memory_sample_count=len(monitor.memory),
         cpu_sample_sum=sum(monitor.cpu), memory_sample_sum=sum(monitor.memory),
         retries=0, pipeline_total_seconds=None,
-        timing_note="Hash includes HDFS read; encryption includes HDFS upload. Audit timers do not overlap stage timers. Summary saving is excluded. Cumulative values are components of this run, not separate S0-S2 experiments.",
+        timing_note="Hash includes HDFS read; encryption includes HDFS upload and output size/fingerprint measurement. HDFS availability measures the target-directory gate before ingestion, not dataset readback. Audit timers do not overlap stage timers. Summary saving is excluded. Cumulative values are components of this run, not separate S0-S2 experiments.",
     )
     result_path = results_dir / ("s3_sqoop_" + run_id + ".json")
     save_error = None
@@ -362,7 +381,7 @@ def main():
         show(label, value)
     for label, value in [("S0-Script-1 time", s0), ("Hash-chain time", timings["hash"]),
                          ("S1-Script-1 total time", s1), ("AES-GCM encryption + upload time", timings["encryption"]),
-                         ("S2-Script-1 total time", s2), ("HDFS availability-check time", timings["hdfs_availability"]),
+                         ("S2-Script-1 total time", s2), ("HDFS target-directory check time", timings["hdfs_availability"]),
                          ("Audit-logging time", timings["audit_logging"]),
                          ("S3-Script-1 total time", s3), ("Script wall-clock time", wall_time)]:
         show(label, f"{value:.6f} seconds")
@@ -372,8 +391,9 @@ def main():
     show("S0 baseline workflow", "RETAINED")
     show("S1 hash-chain generation", stages["hash"])
     show("S2 AES-GCM encryption", stages["encryption"])
-    show("S3 HDFS availability check", stages["hdfs_availability"])
-    show("HDFS output verified", stages["hdfs_availability"])
+    show("S3 HDFS target-directory check", stages["hdfs_availability"])
+    show("HDFS upload size verified", metrics["hdfs_upload_size_verified"])
+    show("Independent HDFS content readback", "NOT TESTED")
     show("HDFS storage size (MB)", f"{storage_bytes / 1_000_000:.6f}" if storage_bytes is not None else "N/A")
     show("Output records", records)
     show("Expected records", expected)
