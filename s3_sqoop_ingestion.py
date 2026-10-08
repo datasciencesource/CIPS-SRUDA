@@ -133,9 +133,10 @@ def check_hdfs_availability(encrypted_file, downloaded_file):
     run_command(["hdfs", "dfs", "-test", "-s", HDFS_FILE], timeout=60)
     run_command(["hdfs", "dfs", "-get", HDFS_FILE, str(downloaded_file)], timeout=300)
     size = downloaded_file.stat().st_size
-    if size != encrypted_file.stat().st_size or digest_file(downloaded_file) != digest_file(encrypted_file):
+    fingerprint = digest_file(downloaded_file)
+    if size != encrypted_file.stat().st_size or fingerprint != digest_file(encrypted_file):
         raise RuntimeError("S3 HDFS dataset differs from the encrypted output; workflow blocked.")
-    return size
+    return size, fingerprint
 
 
 
@@ -163,7 +164,7 @@ def print_instrument_tables(metrics, save_error):
     rows.extend([
         ("Local MySQL write time", "Current", "seconds",
          formatted(metrics["component_seconds"].get("mysql_write"))),
-        ("Total pipeline time", "Current", "seconds", "N/A - whole pipeline not measured"),
+        ("Total pipeline time", "Current", "seconds", "PENDING - completed by matching PySpark run"),
         ("Throughput", "Current", "records/second", formatted(rate) + " (this script only)" if rate is not None else "N/A"),
         ("HDFS storage size", "Current", "MB", formatted(metrics.get("hdfs_storage_mb"))),
         ("Output records", "Current", "records", metrics["output_records"] if metrics["output_records"] is not None else "N/A"),
@@ -222,6 +223,7 @@ def main():
     audit_status = "NOT RUN"
     status, error = "FAILED", "N/A"
     records, storage_bytes = 0, None
+    ciphertext_sha256 = None
     start_label = now()
     workflow_start = time.perf_counter()
     monitor = Monitor()
@@ -292,7 +294,7 @@ def main():
             hash_file, encrypted_file = work / "hashed.csv", work / "data.enc"
             records = stage("hash", lambda: create_hash_chain(hash_file, expected))
             stage("encryption", lambda: encrypt_and_upload(hash_file, encrypted_file, key))
-            storage_bytes = stage("hdfs_availability", lambda: check_hdfs_availability(
+            storage_bytes, ciphertext_sha256 = stage("hdfs_availability", lambda: check_hdfs_availability(
                 encrypted_file, work / "readback.enc"))
         audit("WORKFLOW_COMPLETED", "PASS", "Script-1 complete; ALLOW handoff to Script-2.", records=records)
         status = "SUCCESS"
@@ -323,7 +325,8 @@ def main():
         component_seconds=timings,
         cumulative_seconds={"S0-Script-1": s0, "S1-Script-1": s1, "S2-Script-1": s2, "S3-Script-1": s3},
         script_wall_seconds=wall_time, stage_status=stages, audit_status=audit_status,
-        hdfs_file=HDFS_FILE, hdfs_bytes=storage_bytes,
+        hdfs_file=HDFS_FILE, hdfs_bytes=storage_bytes, ciphertext_sha256=ciphertext_sha256,
+        measurement_schema_version=2,
         hdfs_storage_mb=storage_bytes / 1_000_000 if storage_bytes is not None else None,
         throughput_records_per_second=records / s3 if status == "SUCCESS" and s3 else None,
         cpu_average_percent=mean(monitor.cpu), cpu_peak_percent=max(monitor.cpu, default=None),
@@ -384,11 +387,12 @@ def main():
     show("Monitoring error", monitor.error or "N/A")
     show("Script-1 handoff decision", "ALLOW" if status == "SUCCESS" and not save_error else "BLOCK")
     show("Number of script retries", 0)
+    show("Retry scope", "Automatic retries only; record manual reruns separately")
     show("Abnormal condition observed", "YES" if status != "SUCCESS" or save_error or monitor.error else "NO")
     show("Error / failure message", error)
     show("Audit log file", audit_path)
     show("Measurement record", result_path if not save_error else "SAVE FAILED: " + save_error)
-    show("Total pipeline time", "N/A - Script-2 and dashboard not measured here")
+    show("Total pipeline time", "PENDING - run PySpark next for combined results")
     print("=" * 76)
     print("SAVED JSON RESULT" if not save_error else "JSON RESULT - FILE SAVE FAILED")
     if not save_error:
