@@ -1,15 +1,12 @@
-"""S2 cumulative measurements for Instrument 1.
-Required: SOURCE_TABLE, S2_AES_KEY_B64 and the relevant DB password.
-Keep the same AES key and S2_RESULTS_DIR for both scripts.
-Default result directory: /tmp/s2_results. Each script prints its saved JSON.
-S0/S1 entries are subtotals of this S2 run, not independent experiments.
-Total pipeline time sums S2 component totals, excluding manual gaps,
-Spark startup/cleanup, result matching/saving and Superset.
-CPU/memory are whole-VM samples, not process-specific utilization.
-No S3 availability/connectivity gate or audit log is added.
-AES-GCM uses the original nonce(12) + ciphertext + tag format.
+"""S1 cumulative measurements for Instrument 1.
+Manual prerequisite: create /security_lab/s1. No automatic final-directory creation.
+Required: SOURCE_TABLE and the relevant DB password. No AES key required.
+Results: /tmp/s1_results (override S1_RESULTS_DIR).
+For repeated identical inputs, set S1_SQOOP_RESULT to the exact ingestion JSON.
+S0 timings are subtotals of this S1 run, not independent baseline experiments.
+Hash-chain integrity assumes attackers do not recompute the entire chain.
+No S3 connectivity/availability gate or security audit log is implemented.
 """
-import base64
 import hashlib
 import json
 import math
@@ -29,7 +26,7 @@ DATASETS = {
     "table_stock4M": ("Large", 4248576),
 }
 
-HDFS_INPUT = "hdfs:///security_lab/s2/part-00000.enc"
+HDFS_INPUT = "hdfs:///security_lab/s1/part-00000"
 MYSQL_HOST = os.getenv("LOCAL_DB_HOST", "127.0.0.1").strip()
 MYSQL_URL = (f"jdbc:mysql://{MYSQL_HOST}:3306/dbtest"
              "?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC")
@@ -73,16 +70,15 @@ class Measurement:
         os.umask(0o077)
         self.password = os.getenv(password_variable, "")
         self.password_variable = password_variable
-        self.key_text = os.getenv("S2_AES_KEY_B64", "")
         self.source = os.getenv("SOURCE_TABLE", "")
         scale, self.expected = DATASETS.get(self.source, ("UNKNOWN", None))
-        self.directory = Path(os.getenv("S2_RESULTS_DIR", "/tmp/s2_results"))
+        self.directory = Path(os.getenv("S1_RESULTS_DIR", "/tmp/s1_results"))
         self.monitor = Monitor()
         self.monitor_started = False
         self.started = time.perf_counter()
         self.record = dict(
             measurement_schema_version=1, run_id=uuid.uuid4().hex,
-            strategy="S2", script=script, dataset=scale, source_table=self.source,
+            strategy="S1", script=script, dataset=scale, source_table=self.source,
             expected_records=self.expected, output_records=None,
             start=now(), status="FAILED", error="N/A",
             component_seconds={name: 0.0 for name in names},
@@ -95,17 +91,10 @@ class Measurement:
     def validate(self):
         if not self.password or self.source not in DATASETS:
             raise ValueError(f"Set {self.password_variable} and a valid SOURCE_TABLE.")
-        try:
-            key = base64.b64decode(self.key_text, validate=True)
-            if len(key) != 32:
-                raise ValueError
-        except Exception:
-            raise ValueError("S2_AES_KEY_B64 must decode to exactly 32 bytes.") from None
-        return key
 
     def redact(self, message):
         text = str(message) or type(message).__name__
-        for secret in (self.password, self.key_text):
+        for secret in (self.password,):
             if secret:
                 text = text.replace(secret, "[REDACTED]")
         return text
@@ -142,31 +131,29 @@ class Measurement:
         if part == 1:
             s0 = t["sqoop"]
             s1 = s0 + t["hash"]
-            s2 = s1 + t["encryption"]
         else:
             s0 = t["pyspark_processing"] + t["mysql_write"]
             s1 = s0 + t["hash_verification"]
-            s2 = s1 + t["decryption"]
-        r["cumulative_seconds"] = {f"S{i}-Script-{part}": v for i, v in enumerate((s0,s1,s2))}
-        r["throughput_records_per_second"] = r["output_records"] / s2 if r["status"] == "SUCCESS" and s2 > 0 else None
+        r["cumulative_seconds"] = {f"S{i}-Script-{part}": v for i, v in enumerate((s0,s1))}
+        r["throughput_records_per_second"] = r["output_records"] / s1 if r["status"] == "SUCCESS" and s1 > 0 else None
         for resource, samples in (("cpu",self.monitor.cpu),("memory",self.monitor.memory)):
             r[resource + "_sample_count"] = len(samples)
             r[resource + "_sample_sum"] = sum(samples)
             r[resource + "_average_percent"] = sum(samples)/len(samples) if samples else None
             r[resource + "_peak_percent"] = max(samples) if samples else None
         r["monitoring_error"] = self.monitor.error
-        r["monitoring_window"] = ("ingestion through encryption/upload" if part == 1 else
+        r["monitoring_window"] = ("ingestion through hash generation/upload" if part == 1 else
             "after Spark startup through write/temporary cleanup; includes result matching; excludes Spark cleanup")
         r["resource_measurement_status"] = "COMPLETE" if self.monitor.cpu and self.monitor.memory and not self.monitor.error else "INCOMPLETE"
         r["timing_note"] = (
-            "Hash includes HDFS read; encryption includes upload and size/fingerprint measurement. "
-            "Decryption includes HDFS download. Verification counted once. "
-            "Spark startup/cleanup, result matching/saving and manual gaps excluded from component totals. "
-            "S0/S1 are subtotals of this S2 run, not separate strategy experiments.")
+            "Hash includes HDFS read, chain generation, upload and size/fingerprint measurement. "
+            "PySpark processing includes HDFS download and parse/count. Verification counted once. "
+            "Spark startup/cleanup, matching/saving and manual gaps excluded from component totals. "
+            "S0 values are subtotals of this S1 run, not separate experiments.")
 
     def save_and_show(self):
         r = self.record
-        path = self.directory / f"s2_{r['script']}_{r['run_id']}.json"
+        path = self.directory / f"s1_{r['script']}_{r['run_id']}.json"
         r["result_file"] = str(path.resolve())
         save_error = None
         try:
@@ -177,7 +164,7 @@ class Measurement:
         except Exception as exc:
             save_error = self.redact(exc)
         print("=" * 76)
-        print(f"S2 - CUMULATIVE {r['script'].upper()} RESULT")
+        print(f"S1 - CUMULATIVE {r['script'].upper()} RESULT")
         print(f"Execution status: {r['status']} | Run ID: {r['run_id']}")
         for name, value in r["component_seconds"].items():
             print(f"{name:<30}: {value:.6f} seconds | {r['stage_status'][name]}")
@@ -203,12 +190,12 @@ def table(headers, rows):
 
 def print_instrument_tables(r, save_error):
     part = 1 if r["script"] == "sqoop" else 2
-    print(f"\nB. Performance Measurement | S2 | Script-{part} | {r['dataset']}")
+    print(f"\nB. Performance Measurement | S1 | Script-{part} | {r['dataset']}")
     rows = []
     for strategy in range(4):
         for number in (1,2):
             label = f"S{strategy}-Script-{number}"
-            value = "N/A - not tested" if strategy == 3 else (fmt(r["cumulative_seconds"].get(label)) if number == part else "N/A - other script")
+            value = "N/A - not tested" if strategy >= 2 else (fmt(r["cumulative_seconds"].get(label)) if number == part else "N/A - other script")
             rows.append((label, f"S{strategy}", "seconds", value))
     total = fmt(r.get("pipeline_total_seconds"))
     if part == 1:
@@ -224,8 +211,8 @@ def print_instrument_tables(r, save_error):
                          ("Average memory utilization","memory_average_percent"), ("Peak memory utilization","memory_peak_percent")):
         rows.append((label,"Current","%",fmt(r[field],2)))
     table(["Metric","Strategy","Unit","Recorded Value"],rows)
-    print("S0/S1 are cumulative subtotals of this S2 run; S3 is not tested.")
-    print("Resources: whole VM, 0.5-second samples. Storage: encrypted file only, decimal MB.")
+    print("S0 values are cumulative subtotals of this S1 run; S2/S3 are not tested.")
+    print("Resources: whole VM, 0.5-second samples. Storage: hash-chained file only, decimal MB.")
     print("\nC. Execution Reliability")
     success = r["status"] == "SUCCESS"
     issues = [r["error"]] if r["error"] != "N/A" else []
@@ -246,23 +233,12 @@ def print_instrument_tables(r, save_error):
     ])
     print("Automatic retries only; record manual reruns separately.")
 
-def decrypt_hdfs_file(work, key):
-    from cryptography.exceptions import InvalidTag
-    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-    encrypted = work / "data.enc"
-    decrypted = work / "verified_input.csv"
-    result = subprocess.run(["hdfs", "dfs", "-get", HDFS_INPUT, str(encrypted)])
+def download_and_process(spark, path, expected):
+    result = subprocess.run(["hdfs", "dfs", "-get", HDFS_INPUT, str(path)])
     if result.returncode:
-        raise RuntimeError("Cannot download S2 HDFS dataset; see terminal output.")
-    payload = encrypted.read_bytes()
-    if len(payload) <= 28:
-        raise RuntimeError("S2 encrypted dataset is empty or invalid.")
-    try:
-        plaintext = AESGCM(key).decrypt(payload[:12], payload[12:], None)
-    except InvalidTag:
-        raise RuntimeError("AES-GCM authentication failed: wrong key or altered data.") from None
-    decrypted.write_bytes(plaintext)
-    return decrypted, encrypted
+        raise RuntimeError("Cannot download S1 HDFS dataset; see terminal output.")
+    # Parse and verify this same private copy, preserving original line order.
+    return process_data(spark, path, expected)
 
 def verify_hash_chain(path, expected):
     previous_hash, count = "GENESIS", 0
@@ -312,20 +288,20 @@ def write_mysql(data, password):
      .option("driver", "com.mysql.cj.jdbc.Driver")
      .mode("append").save())
 
-def match_sqoop_result(encrypted_file, results_dir, source_table, expected):
-    """Bind measurements to the exact ciphertext downloaded by this run.
+def match_sqoop_result(input_file, results_dir, source_table, expected):
+    """Bind measurements to the exact hash-chained input downloaded by this run.
 
-    Explicit S2_SQOOP_RESULT wins. Otherwise require exactly one matching
+    Explicit S1_SQOOP_RESULT wins. Otherwise require exactly one matching
     successful record; never choose an unrelated file by modification time.
     Matching is measurement bookkeeping, not an authorization mechanism.
     """
     digest = hashlib.sha256()
-    with encrypted_file.open("rb") as stream:
+    with input_file.open("rb") as stream:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     fingerprint = digest.hexdigest()
-    selected = os.getenv("S2_SQOOP_RESULT")
-    paths = [Path(selected)] if selected else sorted(results_dir.glob("s2_sqoop_*.json"))
+    selected = os.getenv("S1_SQOOP_RESULT")
+    paths = [Path(selected)] if selected else sorted(results_dir.glob("s1_sqoop_*.json"))
     matches = []
     for path in paths:
         try:
@@ -334,21 +310,21 @@ def match_sqoop_result(encrypted_file, results_dir, source_table, expected):
                 raise ValueError("Result is not a JSON object")
             if (record.get("measurement_schema_version") != 1
                     or record.get("hdfs_upload_size_verified") != "PASS"
-                    or record.get("ciphertext_sha256") != fingerprint
-                    or record.get("strategy") != "S2" or record.get("script") != "sqoop"
+                    or record.get("data_sha256") != fingerprint
+                    or record.get("strategy") != "S1" or record.get("script") != "sqoop"
                     or record.get("source_table") != source_table
                     or record.get("dataset") != DATASETS[source_table][0]
                     or record.get("expected_records") != expected
                     or record.get("output_records") != expected
-                    or record.get("hdfs_bytes") != encrypted_file.stat().st_size
-                    or record.get("hdfs_file") != "/security_lab/s2/part-00000.enc"
+                    or record.get("hdfs_bytes") != input_file.stat().st_size
+                    or record.get("hdfs_file") != "/security_lab/s1/part-00000"
                     or record.get("status") != "SUCCESS"
                     or any(record.get("stage_status", {}).get(name) != "PASS"
-                           for name in ("sqoop", "hash", "encryption"))):
-                raise ValueError("Result does not match the successful S2 ingestion and ciphertext")
+                           for name in ("sqoop", "hash"))):
+                raise ValueError("Result does not match the successful S1 ingestion and hash-chained input")
             components = record["component_seconds"]
             running = 0.0
-            for level, names in enumerate((("sqoop",), ("hash",), ("encryption",))):
+            for level, names in enumerate((("sqoop",), ("hash",))):
                 for name in names:
                     value = components[name]
                     if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
@@ -365,9 +341,9 @@ def match_sqoop_result(encrypted_file, results_dir, source_table, expected):
                 raise RuntimeError(f"Selected Sqoop result is invalid: {exc}") from None
     if len(matches) != 1:
         raise RuntimeError(
-            "Cannot uniquely match this encrypted input to a successful updated Sqoop result. "
-            "Run the updated Sqoop script first, keep its JSON, and use the same S2_RESULTS_DIR; "
-            "or set S2_SQOOP_RESULT to its exact JSON path. MySQL write has not started.")
+            "Cannot uniquely match this hash-chained input to a successful updated Sqoop result. "
+            "Run the updated Sqoop script first, keep its JSON, and use the same S1_RESULTS_DIR; "
+            "or set S1_SQOOP_RESULT to its exact JSON path. MySQL write has not started.")
     path, record = matches[0]
     return record, str(path.resolve()), fingerprint
 
@@ -377,7 +353,7 @@ def combine_results(sqoop, pyspark):
         raise ValueError("Combined successful measurements require both scripts to succeed")
     if sqoop["output_records"] != pyspark["output_records"]:
         raise ValueError("Output record counts differ")
-    total = sqoop["cumulative_seconds"]["S2-Script-1"] + pyspark["cumulative_seconds"]["S2-Script-2"]
+    total = sqoop["cumulative_seconds"]["S1-Script-1"] + pyspark["cumulative_seconds"]["S1-Script-2"]
     result = dict(
         measurement_schema_version=1,
         status="SUCCESS", sqoop_run_id=sqoop["run_id"], pyspark_run_id=pyspark["run_id"],
@@ -388,7 +364,7 @@ def combine_results(sqoop, pyspark):
         hdfs_bytes=sqoop["hdfs_bytes"], hdfs_storage_mb=sqoop["hdfs_bytes"] / 1_000_000,
         mysql_write_seconds=pyspark["component_seconds"]["mysql_write"],
         script_wall_seconds_sum=sqoop["script_wall_seconds"] + pyspark["script_wall_seconds"],
-        timing_scope="Sum of S2 component totals; excludes gaps, Spark startup/cleanup, result matching/saving, and Superset",
+        timing_scope="Sum of S1 component totals; excludes gaps, Spark startup/cleanup, result matching/saving, and Superset",
         resource_scope="Whole VM; pooled 0.5-second samples from both active monitoring windows; includes measurement matching; excludes gap and Spark startup/cleanup",
         mysql_output_independently_verified=pyspark["mysql_output_independently_verified"],
         automatic_retries=sqoop["retries"] + pyspark["retries"],
@@ -407,7 +383,7 @@ def combine_results(sqoop, pyspark):
 
 def print_combined_instrument(metrics, save_error):
     result = metrics.get("pipeline_result")
-    print("\nB. Performance Measurement - INSTRUMENT 1 - COMBINED S2 PIPELINE RESULT")
+    print("\nB. Performance Measurement - INSTRUMENT 1 - COMBINED S1 PIPELINE RESULT")
     if result is None:
         print("Combined result unavailable: " + metrics.get("pipeline_measurement_error", "Pipeline did not complete"))
         return
@@ -415,8 +391,8 @@ def print_combined_instrument(metrics, save_error):
         return "N/A - incomplete monitoring" if value is None else f"{value:.{digits}f}"
     rows = [(f"S{s}-Script-{part}", f"S{s}", "seconds",
              fmt(result["cumulative_seconds"][f"S{s}-Script-{part}"]))
-            for s in range(3) for part in (1, 2)]
-    rows += [(f"S3-Script-{part}", "S3", "seconds", "N/A - not tested") for part in (1, 2)]
+            for s in range(2) for part in (1, 2)]
+    rows += [(f"S{level}-Script-{part}", f"S{level}", "seconds", "N/A - not tested") for level in (2, 3) for part in (1, 2)]
     rows += [
         ("Local MySQL write time", "Current", "seconds", fmt(result["mysql_write_seconds"])),
         ("Total pipeline time", "Current", "seconds", fmt(result["total_pipeline_seconds"])),
@@ -435,50 +411,49 @@ def print_combined_instrument(metrics, save_error):
         print("| " + " | ".join(map(str, row)) + " |")
     print("Timing scope: " + result["timing_scope"])
     print("Resource scope: " + result["resource_scope"])
-    print("S0/S1 rows are subtotals of this S2 run, not separate strategy experiments.")
-    print("HDFS size is the encrypted file only; decimal MB, excluding raw staging and replicas.")
+    print("S0 rows are subtotals of this S1 run, not separate strategy experiments.")
+    print("HDFS size is the hash-chained file only; decimal MB, excluding raw staging and replicas.")
     print("Output count is based on completed JDBC write; independent MySQL readback: " + result["mysql_output_independently_verified"])
     print("Automatic retries: " + str(result["automatic_retries"]) + "; record manual reruns separately.")
     print("Resource measurement: " + result["resource_measurement_status"])
     print("Measurement file: " + ("SAVE FAILED: " + save_error if save_error else metrics["result_file"]))
 
 def main():
-    print("Starting S2 PySpark decryption, processing, verification and MySQL write...", flush=True)
-    m = Measurement("pyspark", ("pyspark_processing","mysql_write","hash_verification","decryption"), "LOCAL_DB_PASSWORD")
+    print("Starting S1 PySpark processing, hash verification and MySQL write...", flush=True)
+    m = Measurement("pyspark", ("pyspark_processing","mysql_write","hash_verification"), "LOCAL_DB_PASSWORD")
     r = m.record
     r.update(parsed_records=0, verified_records=0, mysql_write_state="NOT ATTEMPTED",
              mysql_output_independently_verified="NOT TESTED", hdfs_input=HDFS_INPUT,
              spark_startup_seconds=0.0, spark_cleanup_seconds=0.0,
              result_matching_seconds=0.0, sqoop_run_id=None, sqoop_result_file=None,
-             ciphertext_sha256=None, pipeline_result=None,
+             data_sha256=None, pipeline_result=None,
              pipeline_measurement_error="Pipeline did not complete successfully")
     spark = data = sqoop_result = None
     try:
-        key = m.validate()
+        m.validate()
         started = time.perf_counter()
         try:
             from pyspark.sql import SparkSession
-            spark = (SparkSession.builder.appName("S2 Cumulative HDFS to Local MySQL")
+            spark = (SparkSession.builder.appName("S1 Cumulative HDFS to Local MySQL")
                      .master("local[*]").getOrCreate())
             spark.sparkContext.setLogLevel("ERROR")
         finally:
             r["spark_startup_seconds"] = time.perf_counter() - started
         m.start_monitor()
-        with tempfile.TemporaryDirectory(prefix="s2_pyspark_") as temporary:
-            decrypted, encrypted = m.stage("decryption", lambda: decrypt_hdfs_file(Path(temporary), key))
-            r["hdfs_bytes"] = encrypted.stat().st_size
+        with tempfile.TemporaryDirectory(prefix="s1_pyspark_") as temporary:
+            local_input = Path(temporary) / "hashed.csv"
+            data, count = m.stage("pyspark_processing", lambda: download_and_process(spark, local_input, m.expected))
+            r["parsed_records"] = count
+            r["hdfs_bytes"] = local_input.stat().st_size
             r["hdfs_storage_mb"] = r["hdfs_bytes"] / 1_000_000
-            # Require an exact measurement pair before append to avoid unpaired reruns.
-            # This is measurement bookkeeping, not an S3 security gate.
+            # Verify before measurement matching, so tampering is reported by the chain check.
+            r["verified_records"] = m.stage("hash_verification", lambda: verify_hash_chain(local_input, m.expected))
             started = time.perf_counter()
             try:
-                sqoop_result, path, fingerprint = match_sqoop_result(encrypted, m.directory, m.source, m.expected)
-                r.update(sqoop_result_file=path, sqoop_run_id=sqoop_result["run_id"], ciphertext_sha256=fingerprint)
+                sqoop_result, path, fingerprint = match_sqoop_result(local_input, m.directory, m.source, m.expected)
+                r.update(sqoop_result_file=path, sqoop_run_id=sqoop_result["run_id"], data_sha256=fingerprint)
             finally:
                 r["result_matching_seconds"] = time.perf_counter() - started
-            data, count = m.stage("pyspark_processing", lambda: process_data(spark, decrypted, m.expected))
-            r["parsed_records"] = count
-            r["verified_records"] = m.stage("hash_verification", lambda: verify_hash_chain(decrypted, m.expected))
             def save_output():
                 r["mysql_write_state"] = "ATTEMPTED - COMPLETION UNKNOWN"
                 write_mysql(data, m.password)
