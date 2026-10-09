@@ -1,17 +1,12 @@
-"""S2 cumulative measurements for Instrument 1.
-Required: SOURCE_TABLE, S2_AES_KEY_B64 and the relevant DB password.
-Keep the same AES key and S2_RESULTS_DIR for both scripts.
-Default result directory: /tmp/s2_results. Each script prints its saved JSON.
-S0/S1 entries are subtotals of this S2 run, not independent experiments.
-Total pipeline time sums S2 component totals, excluding manual gaps,
-Spark startup/cleanup, result matching/saving and Superset.
-CPU/memory are whole-VM samples, not process-specific utilization.
-Manually create /security_lab/s2 before running. This script never creates
-or removes that final directory; raw staging remains managed by Sqoop.
-No S3 availability/connectivity gate or audit log is added.
-AES-GCM uses the original nonce(12) + ciphertext + tag format.
+"""S1 cumulative measurements for Instrument 1.
+Manual prerequisite: create /security_lab/s1. No automatic final-directory creation.
+Required: SOURCE_TABLE and the relevant DB password. No AES key required.
+Results: /tmp/s1_results (override S1_RESULTS_DIR).
+For repeated identical inputs, set S1_SQOOP_RESULT to the exact ingestion JSON.
+S0 timings are subtotals of this S1 run, not independent baseline experiments.
+Hash-chain integrity assumes attackers do not recompute the entire chain.
+No S3 connectivity/availability gate or security audit log is implemented.
 """
-import base64
 import hashlib
 import json
 import math
@@ -34,9 +29,9 @@ DATASETS = {
 REMOTE_DB_HOST = os.getenv("REMOTE_DB_HOST", "69.175.69.34").strip()
 REMOTE_DB = f"jdbc:mysql://{REMOTE_DB_HOST}/sumrachna_hd"
 USERNAME = "sumrachna_hd"
-RAW_HDFS_TARGET = "/security_lab/s2_raw"
-HDFS_TARGET = "/security_lab/s2"
-HDFS_FILE = HDFS_TARGET + "/part-00000.enc"
+RAW_HDFS_TARGET = "/security_lab/s1_raw"
+HDFS_TARGET = "/security_lab/s1"
+HDFS_FILE = HDFS_TARGET + "/part-00000"
 
 def now():
     return datetime.now().astimezone().isoformat(timespec="seconds")
@@ -75,16 +70,15 @@ class Measurement:
         os.umask(0o077)
         self.password = os.getenv(password_variable, "")
         self.password_variable = password_variable
-        self.key_text = os.getenv("S2_AES_KEY_B64", "")
         self.source = os.getenv("SOURCE_TABLE", "")
         scale, self.expected = DATASETS.get(self.source, ("UNKNOWN", None))
-        self.directory = Path(os.getenv("S2_RESULTS_DIR", "/tmp/s2_results"))
+        self.directory = Path(os.getenv("S1_RESULTS_DIR", "/tmp/s1_results"))
         self.monitor = Monitor()
         self.monitor_started = False
         self.started = time.perf_counter()
         self.record = dict(
             measurement_schema_version=1, run_id=uuid.uuid4().hex,
-            strategy="S2", script=script, dataset=scale, source_table=self.source,
+            strategy="S1", script=script, dataset=scale, source_table=self.source,
             expected_records=self.expected, output_records=None,
             start=now(), status="FAILED", error="N/A",
             component_seconds={name: 0.0 for name in names},
@@ -97,17 +91,10 @@ class Measurement:
     def validate(self):
         if not self.password or self.source not in DATASETS:
             raise ValueError(f"Set {self.password_variable} and a valid SOURCE_TABLE.")
-        try:
-            key = base64.b64decode(self.key_text, validate=True)
-            if len(key) != 32:
-                raise ValueError
-        except Exception:
-            raise ValueError("S2_AES_KEY_B64 must decode to exactly 32 bytes.") from None
-        return key
 
     def redact(self, message):
         text = str(message) or type(message).__name__
-        for secret in (self.password, self.key_text):
+        for secret in (self.password,):
             if secret:
                 text = text.replace(secret, "[REDACTED]")
         return text
@@ -144,31 +131,29 @@ class Measurement:
         if part == 1:
             s0 = t["sqoop"]
             s1 = s0 + t["hash"]
-            s2 = s1 + t["encryption"]
         else:
             s0 = t["pyspark_processing"] + t["mysql_write"]
             s1 = s0 + t["hash_verification"]
-            s2 = s1 + t["decryption"]
-        r["cumulative_seconds"] = {f"S{i}-Script-{part}": v for i, v in enumerate((s0,s1,s2))}
-        r["throughput_records_per_second"] = r["output_records"] / s2 if r["status"] == "SUCCESS" and s2 > 0 else None
+        r["cumulative_seconds"] = {f"S{i}-Script-{part}": v for i, v in enumerate((s0,s1))}
+        r["throughput_records_per_second"] = r["output_records"] / s1 if r["status"] == "SUCCESS" and s1 > 0 else None
         for resource, samples in (("cpu",self.monitor.cpu),("memory",self.monitor.memory)):
             r[resource + "_sample_count"] = len(samples)
             r[resource + "_sample_sum"] = sum(samples)
             r[resource + "_average_percent"] = sum(samples)/len(samples) if samples else None
             r[resource + "_peak_percent"] = max(samples) if samples else None
         r["monitoring_error"] = self.monitor.error
-        r["monitoring_window"] = ("ingestion through encryption/upload" if part == 1 else
+        r["monitoring_window"] = ("ingestion through hash generation/upload" if part == 1 else
             "after Spark startup through write/temporary cleanup; includes result matching; excludes Spark cleanup")
         r["resource_measurement_status"] = "COMPLETE" if self.monitor.cpu and self.monitor.memory and not self.monitor.error else "INCOMPLETE"
         r["timing_note"] = (
-            "Hash includes HDFS read; encryption includes upload and size/fingerprint measurement. "
-            "Decryption includes HDFS download. Verification counted once. "
-            "Spark startup/cleanup, result matching/saving and manual gaps excluded from component totals. "
-            "S0/S1 are subtotals of this S2 run, not separate strategy experiments.")
+            "Hash includes HDFS read, chain generation, upload and size/fingerprint measurement. "
+            "PySpark processing includes HDFS download and parse/count. Verification counted once. "
+            "Spark startup/cleanup, matching/saving and manual gaps excluded from component totals. "
+            "S0 values are subtotals of this S1 run, not separate experiments.")
 
     def save_and_show(self):
         r = self.record
-        path = self.directory / f"s2_{r['script']}_{r['run_id']}.json"
+        path = self.directory / f"s1_{r['script']}_{r['run_id']}.json"
         r["result_file"] = str(path.resolve())
         save_error = None
         try:
@@ -179,7 +164,7 @@ class Measurement:
         except Exception as exc:
             save_error = self.redact(exc)
         print("=" * 76)
-        print(f"S2 - CUMULATIVE {r['script'].upper()} RESULT")
+        print(f"S1 - CUMULATIVE {r['script'].upper()} RESULT")
         print(f"Execution status: {r['status']} | Run ID: {r['run_id']}")
         for name, value in r["component_seconds"].items():
             print(f"{name:<30}: {value:.6f} seconds | {r['stage_status'][name]}")
@@ -205,12 +190,12 @@ def table(headers, rows):
 
 def print_instrument_tables(r, save_error):
     part = 1 if r["script"] == "sqoop" else 2
-    print(f"\nB. Performance Measurement | S2 | Script-{part} | {r['dataset']}")
+    print(f"\nB. Performance Measurement | S1 | Script-{part} | {r['dataset']}")
     rows = []
     for strategy in range(4):
         for number in (1,2):
             label = f"S{strategy}-Script-{number}"
-            value = "N/A - not tested" if strategy == 3 else (fmt(r["cumulative_seconds"].get(label)) if number == part else "N/A - other script")
+            value = "N/A - not tested" if strategy >= 2 else (fmt(r["cumulative_seconds"].get(label)) if number == part else "N/A - other script")
             rows.append((label, f"S{strategy}", "seconds", value))
     total = fmt(r.get("pipeline_total_seconds"))
     if part == 1:
@@ -226,8 +211,8 @@ def print_instrument_tables(r, save_error):
                          ("Average memory utilization","memory_average_percent"), ("Peak memory utilization","memory_peak_percent")):
         rows.append((label,"Current","%",fmt(r[field],2)))
     table(["Metric","Strategy","Unit","Recorded Value"],rows)
-    print("S0/S1 are cumulative subtotals of this S2 run; S3 is not tested.")
-    print("Resources: whole VM, 0.5-second samples. Storage: encrypted file only, decimal MB.")
+    print("S0 values are cumulative subtotals of this S1 run; S2/S3 are not tested.")
+    print("Resources: whole VM, 0.5-second samples. Storage: hash-chained file only, decimal MB.")
     print("\nC. Execution Reliability")
     success = r["status"] == "SUCCESS"
     issues = [r["error"]] if r["error"] != "N/A" else []
@@ -291,33 +276,27 @@ def create_hash_chain(path, expected):
         raise RuntimeError(f"Expected {expected} records but found {count}.")
     return count
 
-def encrypt_and_upload(hash_file, encrypted_file, key):
-    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-    nonce = os.urandom(12)
-    # Preserves the S2 wire format: nonce(12) + ciphertext + GCM tag(16).
-    plaintext = hash_file.read_bytes()
-    encrypted_file.write_bytes(nonce + AESGCM(key).encrypt(nonce, plaintext, None))
-    # Final directory is created manually; replace only its encrypted file.
-    run_command(["hdfs", "dfs", "-put", "-f", str(encrypted_file), HDFS_FILE])
+def hash_and_upload(path, expected):
+    count = create_hash_chain(path, expected)
+    # Only replace the data file; the parent directory must already exist.
+    run_command(["hdfs", "dfs", "-put", "-f", str(path), HDFS_FILE])
     result = run_command(["hdfs", "dfs", "-stat", "%b", HDFS_FILE],
                          capture_output=True, text=True, timeout=60)
     size = int(result.stdout.strip())
-    if size <= 28 or size != encrypted_file.stat().st_size:
-        raise RuntimeError("Uploaded encrypted file size differs from the local output.")
-    # Used by PySpark to match the exact downloaded ciphertext to this run.
-    # This is a local fingerprint, not an independent HDFS content readback.
-    return size, digest_file(encrypted_file)
+    if size <= 0 or size != path.stat().st_size:
+        raise RuntimeError("Uploaded hash-chained file size differs from local output.")
+    return count, size, digest_file(path)
 
 def main():
-    print("Starting S2 Sqoop ingestion, hash chain and AES-GCM encryption...", flush=True)
-    m = Measurement("sqoop", ("sqoop","hash","encryption"), "REMOTE_DB_PASSWORD")
+    print("Starting S1 Sqoop ingestion, hash chain and HDFS upload...", flush=True)
+    m = Measurement("sqoop", ("sqoop","hash"), "REMOTE_DB_PASSWORD")
     r = m.record
-    r.update(hashed_records=0, ciphertext_sha256=None, hdfs_file=HDFS_FILE,
+    r.update(hashed_records=0, data_sha256=None, hdfs_file=HDFS_FILE,
              hdfs_upload_size_verified="NOT VERIFIED", hdfs_content_readback="NOT TESTED")
     try:
-        key = m.validate()
+        m.validate()
         m.start_monitor()
-        with tempfile.TemporaryDirectory(prefix="s2_sqoop_") as temporary:
+        with tempfile.TemporaryDirectory(prefix="s1_sqoop_") as temporary:
             work = Path(temporary)
             password_file = work / "password"
             password_file.write_text(m.password, encoding="utf-8")
@@ -326,12 +305,11 @@ def main():
                        "--username", USERNAME, "--password-file", password_file.as_uri(),
                        "--table", m.source, "--target-dir", RAW_HDFS_TARGET, "--delete-target-dir"]
             m.stage("sqoop", lambda: run_command(command))
-            hashed, encrypted = work / "hashed.csv", work / "data.enc"
-            count = m.stage("hash", lambda: create_hash_chain(hashed, m.expected))
+            hashed = work / "hashed.csv"
+            count, size, fingerprint = m.stage("hash", lambda: hash_and_upload(hashed, m.expected))
             r["hashed_records"] = count
-            size, fingerprint = m.stage("encryption", lambda: encrypt_and_upload(hashed, encrypted, key))
             r.update(output_records=count, hdfs_bytes=size, hdfs_storage_mb=size/1_000_000,
-                     ciphertext_sha256=fingerprint, hdfs_upload_size_verified="PASS")
+                     data_sha256=fingerprint, hdfs_upload_size_verified="PASS")
         r["status"] = "SUCCESS"
     except Exception as exc:
         r["error"] = m.redact(exc)
